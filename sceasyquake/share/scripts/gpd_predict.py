@@ -224,7 +224,8 @@ def process_dayfile(infile, outfile, base_dir=None, verbose=False, plot=False):
     base_dir = base_dir if base_dir else os.path.dirname(__file__)
 
     if model is None:
-        # Try model files in order of preference (easyQuake 2.0 Keras 3 formats)
+        # Try model files in order of preference (easyQuake 2.0 Keras 3 formats first,
+        # then fall back to the original Keras 1/2 JSON + HDF5 format)
         candidates = [
             os.path.join(base_dir, 'model_pol_optimized_converted.keras'),
             os.path.join(base_dir, 'model_pol_final_converted.keras'),
@@ -242,6 +243,21 @@ def process_dayfile(infile, outfile, base_dir=None, verbose=False, plot=False):
                     break
                 except Exception as e:
                     print(f"Failed to load {path}: {e}")
+
+        # Legacy fallback: model_pol.json + model_pol_best.hdf5 (easyQuake < 2.0)
+        if model is None:
+            json_path = os.path.join(base_dir, 'model_pol.json')
+            hdf5_path = os.path.join(base_dir, 'model_pol_best.hdf5')
+            if os.path.isfile(json_path) and os.path.isfile(hdf5_path):
+                try:
+                    from keras.models import model_from_json
+                    with open(json_path) as jf:
+                        model = model_from_json(jf.read())
+                    model.load_weights(hdf5_path)
+                    print(f"Loaded GPD model (legacy JSON+HDF5) from: {base_dir}")
+                except Exception as e:
+                    print(f"Failed to load legacy model: {e}")
+
         if model is None:
             raise RuntimeError(
                 "Failed to load any GPD model variant. "
