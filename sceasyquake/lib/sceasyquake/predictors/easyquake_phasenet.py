@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +39,44 @@ from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_PYTHON = '/home/jwalter/anaconda3/envs/easyquake/bin/python'
+
+def _find_easyquake_python() -> str:
+    """Return path to a Python interpreter that has easyQuake installed.
+
+    Search order:
+      1. Current interpreter — works when sceasyquake and easyQuake share the
+         same env (e.g. a SeisComP venv that also has TF installed).
+      2. Common conda/mamba environment names in standard base directories.
+      3. ``python3`` on PATH as a last resort.
+
+    No subprocesses are spawned; we only check file existence plus
+    ``importlib.util.find_spec`` for the current interpreter.
+    """
+    import importlib.util as _ilu
+    import shutil
+
+    # 1. Current Python already has easyQuake importable
+    if _ilu.find_spec('easyQuake') is not None:
+        return sys.executable
+
+    # 2. Common conda / mamba / venv locations
+    for base in (
+        os.path.expanduser('~/anaconda3'),
+        os.path.expanduser('~/miniconda3'),
+        os.path.expanduser('~/mambaforge'),
+        os.path.expanduser('~/miniforge3'),
+        '/opt/conda',
+    ):
+        for env_name in ('easyquake', 'easyQuake', 'seisml', 'tf', 'seismology'):
+            candidate = os.path.join(base, 'envs', env_name, 'bin', 'python')
+            if os.path.isfile(candidate):
+                return candidate
+
+    # 3. Fall back to python3 on PATH
+    return shutil.which('python3') or sys.executable
+
+
+_DEFAULT_PYTHON = _find_easyquake_python()
 
 
 def _resolve_phasenet_paths(python_cmd: str):

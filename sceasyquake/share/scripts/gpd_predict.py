@@ -265,9 +265,8 @@ def process_dayfile(infile, outfile, base_dir=None, verbose=False, plot=False):
             )
         _CACHED_MODEL = model
 
-    if n_gpu > 1:
-        from keras.utils import multi_gpu_model
-        model = multi_gpu_model(model, gpus=n_gpu)
+    # multi_gpu_model was removed in Keras 3; n_gpu is always 1 for subprocess
+    # inference — the caller controls GPU assignment via CUDA_VISIBLE_DEVICES.
 
     ofile = open(outfile, 'w')
 

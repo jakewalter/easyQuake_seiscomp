@@ -10,10 +10,14 @@ import argparse
 import logging
 import multiprocessing
 import os
+import sys
 import time
 from functools import partial
 
-import h5py
+try:
+    import h5py
+except ImportError:
+    h5py = None  # only needed for --hdf5_file input; MSEED mode works without it
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -21,27 +25,27 @@ from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
-# Model import: always use TF1-checkpoint path via tf.compat.v1.
-# pred_fn uses tf.compat.v1.Session (graph mode), which is incompatible with
-# the Keras 3 UNet in model_tf2.py.  The TF1 checkpoint (model_95.ckpt) still
-# exists in the model directory alongside the .h5 file and loads fine in
-# TF >= 2.12 via tf.compat.v1.  When a full Keras 3 pred_fn is available,
-# switch _get_model_imports() to prefer H5 files.
+# Locate the easyQuake phasenet source directory and add it to sys.path so
+# bare imports (model, data_reader, postprocess) work regardless of which
+# Python version is running.
+#
+# We deliberately do NOT 'import easyQuake.phasenet' because its __init__.py
+# contains 'from easyQuake.phasenet import phasenet_predict', which in turn
+# has bare 'from data_reader import ...' that fails unless phasenet/ is already
+# on sys.path — a circular bootstrap problem.  importlib.util.find_spec only
+# locates the package directory without executing any __init__.py.
 # ---------------------------------------------------------------------------
-try:
-    from model import ModelConfig, UNet
-except ImportError:
-    from easyQuake.phasenet.model import ModelConfig, UNet
+import importlib.util as _ilu
 
-try:
-    from data_reader import DataReader_mseed_array, DataReader_pred
-except ImportError:
-    from easyQuake.phasenet.data_reader import DataReader_mseed_array, DataReader_pred
+_eq_spec = _ilu.find_spec('easyQuake')
+if _eq_spec is not None:
+    _phasenet_src = os.path.join(os.path.dirname(_eq_spec.origin), 'phasenet')
+    if os.path.isdir(_phasenet_src) and _phasenet_src not in sys.path:
+        sys.path.insert(0, _phasenet_src)
 
-try:
-    from postprocess import extract_amplitude, extract_picks, save_picks, save_picks_json, save_prob_h5
-except ImportError:
-    from easyQuake.phasenet.postprocess import extract_amplitude, extract_picks, save_picks, save_picks_json, save_prob_h5
+from model import ModelConfig, UNet
+from data_reader import DataReader_mseed_array, DataReader_pred
+from postprocess import extract_amplitude, extract_picks, save_picks, save_picks_json, save_prob_h5
 
 # TF configuration — disable eager execution for TF1-style graph mode
 logging.info(f"Using TensorFlow {tf.__version__} (TF1-checkpoint path via tf.compat.v1)")
