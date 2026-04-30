@@ -103,8 +103,26 @@
 
 				<parameter name="pretrained" type="string" default="stead">
 					<description>
-						Pretrained weight set name (seisbench backend only).
-						Ignored when picker.model_path is set.
+						Base architecture / pretrained weight set (seisbench backend only).
+
+						This parameter has two roles depending on whether picker.model_path
+						is set:
+
+						• No model_path (standard pretrained weights):  Names the weight
+						  set downloaded from the SeisBench model hub and used directly
+						  for inference.
+
+						• With model_path pointing to a raw .pt/.pth state-dict file:
+						  Names the base architecture template used to construct the
+						  model object (norm mode, label layout, sampling rate, etc.)
+						  before the custom weights are loaded.  The pretrained weights
+						  themselves are immediately replaced by the file in model_path.
+						  Set this to the weight set whose architecture most closely
+						  matches how your custom model was trained.
+
+						• With model_path pointing to a SeisBench directory (contains
+						  .pt + .json):  This parameter is ignored entirely; all
+						  architecture metadata is read from the .json file.
 
 						Common values by architecture:
 						  phasenet     : stead (default), diting, ethz, scedc, geofon
@@ -116,14 +134,18 @@
 				<parameter name="model_path" type="string" default="">
 					<description>
 						Path to custom model weights (seisbench backend only).
-						Leave empty to use the pretrained weights named by
-						picker.pretrained.
+						Leave empty to use the hub weights named by picker.pretrained.
 
 						Accepted formats:
-						• SeisBench save directory containing a .pt weights file
-						  and a matching .json metadata file.
-						• Raw PyTorch state-dict file (.pt / .pth) loaded on top
-						  of the pretrained base architecture.
+						• SeisBench save directory containing a matching .pt weights
+						  file and .json metadata file.  All architecture settings come
+						  from the .json; picker.pretrained is ignored.
+						• Raw PyTorch state-dict file (.pt / .pth).  The model object
+						  is first constructed from picker.pretrained (as a template
+						  for architecture/norm/labels), then the weights are replaced
+						  by this file.  Set picker.pretrained to the weight set whose
+						  architecture matches your training setup (e.g. stead for a
+						  PhaseNet model trained on STEAD-style normalisation).
 
 						Has no effect when picker.backend = easyquake.
 					</description>

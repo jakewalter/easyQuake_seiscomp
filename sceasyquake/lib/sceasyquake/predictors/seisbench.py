@@ -8,17 +8,33 @@ the picker-specific module, or when loading custom-trained weights.
 Config parameters (sceasyquake.cfg):
     picker.backend    = seisbench
     picker.model      = PhaseNet       # PhaseNet | GPD | EQTransformer
-    picker.pretrained = stead          # pretrained weight set name
-    picker.model_path =                # optional; overrides pretrained
+    picker.pretrained = stead          # see below
+    picker.model_path =                # optional path to custom weights
 
-Custom weight loading
----------------------
-``picker.model_path`` is resolved as follows (in order):
+Role of ``picker.pretrained``
+-----------------------------
+This parameter serves **two different purposes** depending on ``model_path``:
 
-1. **Raw state-dict** – path ends in ``.pt`` and the file exists.
-   The named model class is instantiated with defaults and
-   ``load_state_dict(torch.load(path))`` is called.  Matches the pattern
-   used in ``easyQuake/seisbench/run_seisbench.py``.
+* **No model_path** (hub weights): ``pretrained`` names the weight set
+  downloaded from the SeisBench model hub and used directly for inference,
+  e.g. ``stead``, ``original``, ``ethz``.
+
+* **model_path = raw .pt/.pth state-dict**: ``pretrained`` names the base
+  architecture template — the model is first constructed via
+  ``from_pretrained(pretrained)`` to capture its norm mode, label layout,
+  sampling rate, and component order, then the weights are immediately
+  replaced by the file in ``model_path``.  The pretrained weights themselves
+  are not used at inference time.  Set this to the weight set whose
+  architecture settings match how your custom model was trained.
+
+* **model_path = SeisBench directory (.pt + .json)**: ``pretrained`` is
+  ignored entirely; all architecture metadata is read from the ``.json``.
+
+Custom weight loading (``model_path`` resolution order)
+-------------------------------------------------------
+1. **Raw state-dict** – path ends in ``.pt``/``.pth`` and the file exists.
+   ``from_pretrained(pretrained)`` builds the model shell; custom weights
+   are then applied via ``load_state_dict``.
 
 2. **SeisBench-format directory** – path is a directory (or a base-name with
    a sibling ``.json`` file).  Loaded via ``ModelClass.load(path)``.  This is
