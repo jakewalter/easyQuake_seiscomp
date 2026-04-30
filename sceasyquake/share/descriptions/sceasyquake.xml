@@ -50,54 +50,93 @@
 			<!-- ============================================================ -->
 			<group name="picker">
 				<description>
-					Settings for the SeisBench ML phase picker.
+					Settings for the ML phase picker.
+
+					There are two execution backends:
+
+					seisbench  – Uses the SeisBench library (PyTorch-based).
+					             Supports all three architectures (PhaseNet, GPD,
+					             EQTransformer) and accepts custom model weights
+					             via picker.model_path.
+
+					easyquake  – Uses the bundled easyQuake TF/Keras wrappers.
+					             Supports PhaseNet and GPD only.  Always runs with
+					             the built-in pretrained weights; picker.model_path
+					             is ignored.
+
+					Select the backend with picker.backend, then choose the model
+					architecture with picker.model.
 				</description>
 
-				<parameter name="backend" type="string" default="phasenet" values="phasenet,gpd,eqtransformer,stub">
+				<parameter name="backend" type="string" default="seisbench" values="seisbench,easyquake,stub">
 					<description>
-						ML model to use for phase detection:
-						phasenet     – PhaseNet via SeisBench (Zhu &amp; Beroza 2019).
-						               Picks both P and S; best results with
-						               picker.model_path pointing to custom weights.
-						gpd          – Generalized Phase Detection via SeisBench
-						               (Ross et al. 2018). Default threshold 0.994.
-						eqtransformer – EQTransformer via SeisBench (Mousavi et al.
-						               2020). Multi-component, P+S+detection.
-						stub         – Built-in stub that does not produce real picks.
-						               Use for testing the messaging pipeline only.
+						Execution backend for ML inference:
+
+						seisbench  – SeisBench (PyTorch).  Supports PhaseNet, GPD,
+						             and EQTransformer.  Custom weights can be loaded
+						             via picker.model_path.
+						easyquake  – easyQuake TF/Keras wrappers.  Supports PhaseNet
+						             and GPD only.  Uses built-in pretrained weights
+						             (picker.model_path has no effect).
+						stub       – No-op stub; useful for testing the messaging
+						             pipeline without real picks.
+					</description>
+				</parameter>
+
+				<parameter name="model" type="string" default="phasenet" values="phasenet,eqtransformer,gpd">
+					<description>
+						Model architecture to use for phase detection.
+
+						phasenet     – PhaseNet (Zhu &amp; Beroza 2019).  Available
+						               for both seisbench and easyquake backends.
+						eqtransformer – EQTransformer (Mousavi et al. 2020).
+						               Only available with the seisbench backend.
+						gpd          – Generalized Phase Detection (Ross et al. 2018).
+						               Available for both seisbench and easyquake
+						               backends.  Uses a higher default threshold
+						               (picker.gpd_threshold = 0.994).
+
+						For the easyquake backend, eqtransformer is not supported
+						and will fall back to phasenet.
 					</description>
 				</parameter>
 
 				<parameter name="pretrained" type="string" default="stead">
 					<description>
-						Pretrained weight set to use when picker.model_path is not
-						set.  Common values per model:
-						PhaseNet     : stead (default), diting, ethz, scedc, geofon
-						GPD          : original (default), scedc, geofon
-						EQTransformer: original (default), ethz, scedc, stead
+						Pretrained weight set name (seisbench backend only).
+						Ignored when picker.model_path is set.
+
+						Common values by architecture:
+						  phasenet     : stead (default), diting, ethz, scedc, geofon
+						  gpd          : original (default), scedc, geofon
+						  eqtransformer: original (default), ethz, scedc, stead
 					</description>
 				</parameter>
 
 				<parameter name="model_path" type="string" default="">
 					<description>
-						Path to custom model weights.  Leave empty to use the
-						pretrained weights selected by picker.pretrained.
+						Path to custom model weights (seisbench backend only).
+						Leave empty to use the pretrained weights named by
+						picker.pretrained.
+
 						Accepted formats:
-						• Raw PyTorch state-dict (.pt / .pth file) – loaded on top
-						  of the pretrained base model.
-						• SeisBench save directory (contains .pt + .json).
-						When set, picker.pretrained is still used as the base
-						architecture for loading the state-dict.
+						• SeisBench save directory containing a .pt weights file
+						  and a matching .json metadata file.
+						• Raw PyTorch state-dict file (.pt / .pth) loaded on top
+						  of the pretrained base architecture.
+
+						Has no effect when picker.backend = easyquake.
 					</description>
 				</parameter>
 
 				<parameter name="label_order" type="string" default="">
 					<description>
-						Output channel order the model was trained with, e.g. PSN.
-						SeisBench PhaseNet natively uses NPS order.  When a custom
+						Output channel order the model was trained with (seisbench
+						backend only).  Leave empty for standard pretrained weights.
+
+						SeisBench PhaseNet uses NPS order by default.  If a custom
 						model was trained with a different output order (e.g. PSN),
-						set this so the output layer weights are reordered on load.
-						Leave empty if using standard pretrained weights.
+						set this parameter so the output weights are reordered.
 						Example: PSN  (P=channel 0, S=channel 1, Noise=channel 2)
 					</description>
 				</parameter>
