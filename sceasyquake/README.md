@@ -89,14 +89,18 @@ bash install.sh          # auto-detects $SEISCOMP_ROOT or ~/seiscomp
 
 ### 5. Install the easyQuake TF environment (optional — for GPD and PhaseNet native backends)
 
-The `gpd` and `phasenet` backends use a separate **Python 3.7 / TensorFlow 1.x**
-conda environment that ships with easyQuake.  This environment is invoked as a
-subprocess and does **not** need SeisComP bindings.
+> **Skip this step** if you are using `picker.backend = seisbench` — the SeisBench
+> backend runs GPD, PhaseNet, and EQTransformer entirely within SeisComP's Python
+> environment and does not need a separate conda env.
+
+The `gpd` and `phasenet` (native easyQuake) backends invoke easyQuake's TF inference
+scripts as a subprocess using a dedicated **Python 3.7 / TensorFlow 2.2** conda
+environment.  This environment does **not** need SeisComP bindings.
 
 ```bash
 conda create -n easyquake python=3.7
 conda activate easyquake
-pip install easyquake   # installs TF 1.x, Keras, obspy, etc.
+pip install easyquake   # installs TF 2.2, Keras 2.3, obspy, etc.
 conda deactivate
 ```
 

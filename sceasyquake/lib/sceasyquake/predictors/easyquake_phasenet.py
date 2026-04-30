@@ -1,7 +1,7 @@
 """EasyQuake TF-based PhaseNet predictor.
 
 Wraps the easyQuake phasenet_predict.py script as a single-subprocess batch
-call.  TensorFlow 1.x (via tf.compat.v1) is used by easyQuake PhaseNet and
+call.  TensorFlow 2.2 (via tf.compat.v1) is used by easyQuake PhaseNet and
 *cannot* be run in-process alongside PyTorch — the module-level call to
 ``tf.compat.v1.disable_eager_execution()`` in data_reader.py is incompatible
 with modern TF/PT code.  A subprocess is therefore the only viable approach.
