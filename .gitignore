@@ -1,0 +1,20 @@
+# Ignore everything at the root level...
+/*
+
+# ...except these
+!/.gitignore
+!/sceasyquake/
+
+# Python artifacts inside sceasyquake
+sceasyquake/__pycache__/
+sceasyquake/**/__pycache__/
+sceasyquake/**/*.py[cod]
+sceasyquake/**/*.egg-info/
+sceasyquake/.pytest_cache/
+sceasyquake/**/.pytest_cache/
+
+# IDEs / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

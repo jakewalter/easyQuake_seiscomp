@@ -1,0 +1,13 @@
+[Unit]
+Description=SeisComP easyQuake worker
+After=network.target
+
+[Service]
+Type=simple
+User=seiscomp
+Group=seiscomp
+ExecStart=/usr/bin/env python /opt/seiscomp/share/sceasyquake/bin/sceasyquake-worker.py --job-dir /var/spool/sceasyquake/jobs --python-cmd '/home/seiscomp/.conda/envs/sceasyquake/bin/python'
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
