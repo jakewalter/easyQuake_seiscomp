@@ -215,6 +215,11 @@ def pred_fn(args, data_reader, figure_dir=None, prob_dir=None, log_dir=None):
             # save_picks(picks, args.result_dir, amps=amps, fname=args.result_fname+".csv")
             # save_picks_json(picks, args.result_dir, dt=data_reader.dt, amps=amps, fname=args.result_fname+".json")
             df = pd.DataFrame(picks)
+            # Older easyQuake (<2.0) postprocess.py does not include phase_prob in
+            # the pick dicts.  Inject a NaN sentinel so the column selector below
+            # always works; the upstream parser treats NaN as "no probability".
+            if "phase_prob" not in df.columns:
+                df["phase_prob"] = float("nan")
             # df["fname"] = df["file_name"]
             # df["id"] = df["station_id"]
             # df["timestamp"] = df["phase_time"]

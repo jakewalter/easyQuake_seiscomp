@@ -55,11 +55,47 @@ def _find_easyquake_python() -> str:
     import importlib.util as _ilu
     import shutil
 
-    # 1. Current Python already has easyQuake importable
-    if _ilu.find_spec('easyQuake') is not None:
+    def _has_tf(python_path: str) -> bool:
+        """True if ``python_path`` has both easyQuake and tensorflow."""
+        try:
+            prefix = os.path.dirname(os.path.dirname(python_path))
+            for lib_dir in (
+                os.path.join(prefix, 'lib'),
+                os.path.join(prefix, 'lib', 'python3.7', 'site-packages'),
+                os.path.join(prefix, 'lib', 'python3.8', 'site-packages'),
+                os.path.join(prefix, 'lib', 'python3.9', 'site-packages'),
+                os.path.join(prefix, 'lib', 'python3.10', 'site-packages'),
+                os.path.join(prefix, 'lib', 'python3.11', 'site-packages'),
+            ):
+                if os.path.isdir(os.path.join(lib_dir, 'tensorflow')) or \
+                   os.path.isdir(os.path.join(lib_dir, 'tensorflow_core')):
+                    return True
+            import glob
+            for tf_dir in glob.glob(os.path.join(prefix, 'lib', 'python*', 'site-packages', 'tensorflow*')):
+                if os.path.isdir(tf_dir):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    # 1. Dedicated conda / mamba env named after easyquake (preferred).
+    for base in (
+        os.path.expanduser('~/anaconda3'),
+        os.path.expanduser('~/miniconda3'),
+        os.path.expanduser('~/mambaforge'),
+        os.path.expanduser('~/miniforge3'),
+        '/opt/conda',
+    ):
+        for env_name in ('easyquake', 'easyQuake', 'seisml', 'tf', 'seismology'):
+            candidate = os.path.join(base, 'envs', env_name, 'bin', 'python')
+            if os.path.isfile(candidate) and _has_tf(candidate):
+                return candidate
+
+    # 2. Current interpreter — only if it also has TF
+    if _ilu.find_spec('easyQuake') is not None and _ilu.find_spec('tensorflow') is not None:
         return sys.executable
 
-    # 2. Common conda / mamba / venv locations
+    # 3. Any conda env candidate that at least exists
     for base in (
         os.path.expanduser('~/anaconda3'),
         os.path.expanduser('~/miniconda3'),
@@ -72,7 +108,7 @@ def _find_easyquake_python() -> str:
             if os.path.isfile(candidate):
                 return candidate
 
-    # 3. Fall back to python3 on PATH
+    # 4. Fall back to python3 on PATH
     return shutil.which('python3') or sys.executable
 
 
