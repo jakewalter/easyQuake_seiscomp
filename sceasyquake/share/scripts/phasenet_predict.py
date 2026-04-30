@@ -1,26 +1,15 @@
-# sceasyquake: inject our patched postprocess (adds phase_prob to pick dicts)
-# before any other import resolves it from the easyQuake package directory.
-import importlib.util as _ilu, pathlib as _pl, sys as _sys
-_here = _pl.Path(__file__).resolve().parent
-# Add the installed easyQuake phasenet directory to sys.path so that sibling
-# modules (detect_peaks, etc.) used by postprocess.py can be imported.
-import easyQuake as _eq
-_phasenet_pkg_dir = str(_pl.Path(_eq.__file__).parent / 'phasenet')
-if _phasenet_pkg_dir not in _sys.path:
-    _sys.path.insert(0, _phasenet_pkg_dir)
-del _eq, _phasenet_pkg_dir
-_postprocess_spec = _ilu.spec_from_file_location("postprocess", _here / "postprocess.py")
-_postprocess_mod = _ilu.module_from_spec(_postprocess_spec)
-_sys.modules["postprocess"] = _postprocess_mod
-_postprocess_spec.loader.exec_module(_postprocess_mod)
-del _ilu, _pl, _sys, _here, _postprocess_spec, _postprocess_mod
-# end sceasyquake override
+# sceasyquake patched phasenet_predict.py
+# Compatible with easyQuake 2.0 (Python 3.10+, TF >= 2.12, Keras 3).
+# easyQuake 2.0 postprocess.py already includes phase_prob in pick dicts;
+# the old injection shim is no longer needed.
+# Output format is kept as space-separated CSV (no header) with columns:
+#   network station_id chan_pick phase_type phase_time phase_prob
+# This matches what sceasyquake's EasyQuakePhaseNetPredictor expects.
 
 import argparse
 import logging
 import multiprocessing
 import os
-import pickle
 import time
 from functools import partial
 
@@ -28,50 +17,47 @@ import h5py
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from data_reader import DataReader_mseed_array, DataReader_pred
-from model import ModelConfig, UNet
-from postprocess import (
-    extract_amplitude,
-    extract_picks,
-    save_picks,
-    save_picks_json,
-    save_prob_h5,
-)
-#from pymongo import MongoClient
 from tqdm import tqdm
-#from visulization import plot_waveform
 
-tf.compat.v1.disable_eager_execution()
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
-physical_devices = tf.config.experimental.list_physical_devices('GPU')
+
+# ---------------------------------------------------------------------------
+# Model import: always use TF1-checkpoint path via tf.compat.v1.
+# pred_fn uses tf.compat.v1.Session (graph mode), which is incompatible with
+# the Keras 3 UNet in model_tf2.py.  The TF1 checkpoint (model_95.ckpt) still
+# exists in the model directory alongside the .h5 file and loads fine in
+# TF >= 2.12 via tf.compat.v1.  When a full Keras 3 pred_fn is available,
+# switch _get_model_imports() to prefer H5 files.
+# ---------------------------------------------------------------------------
+try:
+    from model import ModelConfig, UNet
+except ImportError:
+    from easyQuake.phasenet.model import ModelConfig, UNet
+
+try:
+    from data_reader import DataReader_mseed_array, DataReader_pred
+except ImportError:
+    from easyQuake.phasenet.data_reader import DataReader_mseed_array, DataReader_pred
+
+try:
+    from postprocess import extract_amplitude, extract_picks, save_picks, save_picks_json, save_prob_h5
+except ImportError:
+    from easyQuake.phasenet.postprocess import extract_amplitude, extract_picks, save_picks, save_picks_json, save_prob_h5
+
+# TF configuration — disable eager execution for TF1-style graph mode
+logging.info(f"Using TensorFlow {tf.__version__} (TF1-checkpoint path via tf.compat.v1)")
+if hasattr(tf.compat, 'v1'):
+    tf.compat.v1.disable_eager_execution()
+    if hasattr(tf.compat.v1, 'logging'):
+        tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+physical_devices = tf.config.list_physical_devices('GPU')
 if physical_devices:
     try:
-        tf.config.experimental.set_virtual_device_configuration(
-            physical_devices[0],
-            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=6000)])
-        logical_gpus = tf.config.list_logical_devices('GPU')
+        for dev in physical_devices:
+            tf.config.experimental.set_memory_growth(dev, True)
     except (RuntimeError, Exception) as e:
-        print("GPU virtual device configuration failed (another process may be using GPU memory); running on CPU:", e)
+        print("GPU memory growth config failed; running on CPU:", e)
 else:
     print("No GPU visible (CUDA_VISIBLE_DEVICES may be -1); running on CPU.")
-#username = "root"
-#password = "quakeflow123"
-# client = MongoClient(f"mongodb://{username}:{password}@127.0.0.1:27017")
-#client = MongoClient(f"mongodb://{username}:{password}@quakeflow-mongodb-headless.default.svc.cluster.local:27017")
-
-# db = client["quakeflow"]
-# collection = db["waveform"]
-
-
-#def upload_mongodb(picks):
-#    db = client["quakeflow"]
-#    collection = db["waveform"]
-#    try:
-#        collection.insert_many(picks)
-#    except Exception as e:
-#        print("Warning:", e)
-#        collection.delete_many({"_id": {"$in": [p["_id"] for p in picks]}})
-#        collection.insert_many(picks)
 
 
 def read_args():
@@ -79,6 +65,8 @@ def read_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch_size", default=4, type=int, help="batch size")
     parser.add_argument("--model_dir", help="Checkpoint directory (default: None)")
+    # --model is an alias so the sceasyquake subprocess call using --model works
+    parser.add_argument("--model", dest="model_dir", help="Checkpoint directory (same as --model_dir)")
     parser.add_argument("--data_dir", default="", help="Input file directory")
     parser.add_argument("--data_list", default="", help="Input csv file")
     parser.add_argument("--hdf5_file", default="", help="Input hdf5 file")

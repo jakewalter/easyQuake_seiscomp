@@ -94,13 +94,15 @@ bash install.sh          # auto-detects $SEISCOMP_ROOT or ~/seiscomp
 > environment and does not need a separate conda env.
 
 The `gpd` and `phasenet` (native easyQuake) backends invoke easyQuake's TF inference
-scripts as a subprocess using a dedicated **Python 3.7 / TensorFlow 2.2** conda
+scripts as a subprocess using a dedicated **Python 3.10+ / TensorFlow ≥ 2.12** conda
 environment.  This environment does **not** need SeisComP bindings.
 
+easyQuake 2.0 requires Python 3.10 or newer and TF 2.12+ (Keras 3 model format).
+
 ```bash
-conda create -n easyquake python=3.7
+conda create -n easyquake python=3.10
 conda activate easyquake
-pip install easyquake   # installs TF 2.2, Keras 2.3, obspy, etc.
+pip install git+https://github.com/jakewalter/easyQuake.git@development
 conda deactivate
 ```
 
@@ -115,9 +117,9 @@ under `share/scripts/`:
 
 | File | Purpose |
 |---|---|
-| `share/scripts/gpd_predict.py` | GPD — removes 3–20 Hz bandpass filter and cosine taper so preprocessing matches SeisBench GPD (both apply max-normalisation inside `forward()`); adds per-pick probability to output |
-| `share/scripts/phasenet_predict.py` | PhaseNet — injects patched `postprocess` module so per-pick probability is included in CSV output |
-| `share/scripts/postprocess.py` | PhaseNet postprocess — adds `"phase_prob"` key to pick dicts returned by `extract_picks()` |
+| `share/scripts/gpd_predict.py` | GPD — removes 3–20 Hz bandpass filter so preprocessing matches SeisBench GPD (both apply max-normalisation inside the model); adds per-pick probability to output; uses Keras 3 model loading (easyQuake 2.0) |
+| `share/scripts/phasenet_predict.py` | PhaseNet — updated for TF 2.12+ (no legacy shim injection; easyQuake 2.0 `postprocess.py` already includes `phase_prob`) |
+| `share/scripts/postprocess.py` | PhaseNet postprocess — kept for compatibility with older easyQuake installs; superseded by easyQuake 2.0 `postprocess.py` which already includes `"phase_prob"` |
 
 These files are **used automatically** — `_resolve_gpd_paths` and
 `_resolve_phasenet_paths` in the predictor classes check for them at startup

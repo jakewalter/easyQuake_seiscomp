@@ -15,25 +15,18 @@ import os
 
 import numpy as np
 import obspy.core as oc
-from keras.models import model_from_json
-import tensorflow as tf
 import pylab as plt
-#mpl.rcParams['pdf.fonttype'] = 42
-#physical_devices = tf.config.list_physical_devices('GPU')
+
 try:
-  physical_devices = tf.config.experimental.list_physical_devices('GPU')
-  #tf.config.experimental.set_memory_growth(physical_devices[0], True)
-  #[tf.config.experimental.set_memory_growth(physical_devices[i], True) for i in range(0,len(physical_devices))]
-  tf.config.experimental.set_virtual_device_configuration(physical_devices[0],[tf.config.experimental.VirtualDeviceConfiguration(memory_limit=2000)])
-  logical_gpus = tf.config.list_logical_devices('GPU')
-except:
-  tf_config=tf.ConfigProto()
-  tf_config.gpu_options.allow_growth=True
-  sess = tf.Session(config=tf_config)
-#  physical_devices = tf.config.experimental.list_physical_devices('GPU')
-#  tf.config.experimental.set_memory_growth(physical_devices[0], True)
-  # Invalid device or cannot modify virtual devices once initialized.
-  pass
+    import tensorflow as tf
+    try:
+        physical_devices = tf.config.list_physical_devices('GPU')
+        for dev in physical_devices:
+            tf.config.experimental.set_memory_growth(dev, True)
+    except Exception:
+        pass
+except Exception:
+    raise
 #####################
 # Hyperparameters
 min_proba = 0.994 # Minimum softmax probability for phase detection
@@ -203,33 +196,64 @@ def main():
     args = parser.parse_args()
 
     plot = args.P
+    # Delegate to reusable function
+    process_dayfile(args.I, args.O, base_dir=args.F, verbose=args.V, plot=plot)
 
-    # Reading in input file
+
+# module-level model cache (per-process) to avoid reloading on every call
+_CACHED_MODEL = None
+
+
+def process_dayfile(infile, outfile, base_dir=None, verbose=False, plot=False):
+    """Process infile and write picks (with probability) to outfile.
+
+    Callable programmatically; caches the loaded model per process.
+    """
+    global _CACHED_MODEL
+
     fdir = []
-    evid = []
-    staid = []
-    with open(args.I) as f:
+    with open(infile) as f:
         for line in f:
             tmp = line.split()
             fdir.append([tmp[0], tmp[1], tmp[2]])
     nsta = len(fdir)
 
-    # load json and create model
-    pathjson = args.F+'/model_pol.json'
-    json_file = open(pathjson, 'r')
-    loaded_model_json = json_file.read()
-    json_file.close()
-    model = model_from_json(loaded_model_json, custom_objects={'tf':tf})
+    import keras
 
-    # load weights into new model
-    model.load_weights(args.F+"/model_pol_best.hdf5")
-    print("Loaded model from disk")
+    model = _CACHED_MODEL
+    base_dir = base_dir if base_dir else os.path.dirname(__file__)
+
+    if model is None:
+        # Try model files in order of preference (easyQuake 2.0 Keras 3 formats)
+        candidates = [
+            os.path.join(base_dir, 'model_pol_optimized_converted.keras'),
+            os.path.join(base_dir, 'model_pol_final_converted.keras'),
+            os.path.join(base_dir, 'model_pol_gpd_calibrated_F80.h5'),
+            os.path.join(base_dir, 'model_pol_properly_converted.keras'),
+            os.path.join(base_dir, 'model_pol_fixed.h5'),
+            os.path.join(base_dir, 'model_pol_new.keras'),
+            os.path.join(base_dir, 'model_pol_legacy.h5'),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                try:
+                    model = keras.models.load_model(path)
+                    print(f"Loaded GPD model from: {path}")
+                    break
+                except Exception as e:
+                    print(f"Failed to load {path}: {e}")
+        if model is None:
+            raise RuntimeError(
+                "Failed to load any GPD model variant. "
+                "Run easyQuake model conversion or reinstall easyQuake."
+            )
+        _CACHED_MODEL = model
 
     if n_gpu > 1:
         from keras.utils import multi_gpu_model
         model = multi_gpu_model(model, gpus=n_gpu)
 
-    ofile = open(args.O, 'w')
+    ofile = open(outfile, 'w')
 
     for i in range(nsta):
         try:
@@ -244,10 +268,10 @@ def main():
                 print("%s doesn't exist, skipping" % fdir[i][2])
                 continue
             st = oc.Stream()
-            st += oc.read(fdir[i][0])
-            st += oc.read(fdir[i][1])
-            st += oc.read(fdir[i][2])
-            #st.resample(100)
+            st += oc.read(fdir[i][0])  # N
+            st += oc.read(fdir[i][1])  # E
+            st += oc.read(fdir[i][2])  # Z
+            st.sort(['channel'])
             st.detrend(type='linear')
             # Bandpass filter and taper are disabled so GPD-easyquake and
             # GPD-seisbench receive identically preprocessed data.
@@ -261,21 +285,17 @@ def main():
                 if isinstance(tr.data, np.ma.masked_array):
                     tr.data = tr.data.filled()
 
-    
-    
-
             chan = st[0].stats.channel
             sr = st[0].stats.sampling_rate
-    
             dt = st[0].stats.delta
             net = st[0].stats.network
             sta = st[0].stats.station
             chan = st[0].stats.channel
             latest_start = np.max([x.stats.starttime for x in st])
             earliest_stop = np.min([x.stats.endtime for x in st])
-            if (earliest_stop>latest_start):
+            if (earliest_stop > latest_start):
                 st.trim(latest_start, earliest_stop)
-                if args.V:
+                if verbose:
                     print("Reshaping data matrix for sliding window")
                 tt = (np.arange(0, st[0].data.size, n_shift) + n_win) * dt
                 tt_i = np.arange(0, st[0].data.size, n_shift) + n_feat
@@ -291,7 +311,7 @@ def main():
                 tt = tt[:tr_win.shape[0]]
                 tt_i = tt_i[:tr_win.shape[0]]
         
-                if args.V:
+                if verbose:
                     ts = model.predict(tr_win, verbose=True, batch_size=batch_size)
                 else:
                     ts = model.predict(tr_win, verbose=False, batch_size=batch_size)
@@ -361,8 +381,10 @@ def main():
                             ax[i].axvline(s_pick-st[0].stats.starttime, c='b', lw=0.5)
                     plt.tight_layout()
                     plt.show()
-        except:
-            pass
+        except Exception as e:
+            print(f"Exception processing station {i}: {e}")
+            import traceback
+            traceback.print_exc()
     ofile.close()
 
 

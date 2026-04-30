@@ -4,6 +4,10 @@ Wraps easyQuake's gpd_predict.py as a subprocess call, identical in structure
 to EasyQuakePhaseNetPredictor.  GPD uses Keras/TF (Ross et al. 2018) and
 cannot run in-process alongside PyTorch.
 
+easyQuake 2.0 uses Keras 3 model format (.keras / .h5); the patched
+``share/scripts/gpd_predict.py`` loads models via ``keras.models.load_model()``
+instead of the old ``model_from_json`` + HDF5-weights approach.
+
 GPD differences from PhaseNet:
 - CLI: ``-I infile -O outfile -F model_dir``  (no threshold flags)
 - Threshold (min_proba=0.994) is hardcoded in gpd_predict.py
