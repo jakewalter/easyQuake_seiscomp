@@ -240,7 +240,7 @@ Measured on:
 
 | Component | Spec |
 |---|---|
-| CPU | Intel Core i9 (12 physical / 24 logical cores) |
+| CPU | AMD Ryzen 9 3900X (12 physical / 24 logical cores) |
 | GPU | NVIDIA GeForce RTX 2070 SUPER (8 GB VRAM) |
 | Driver / CUDA | 525+ / 12.8 |
 | PyTorch | 2.8.0+cu128 |
