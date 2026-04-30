@@ -86,11 +86,20 @@ class EQTransformerPredictor:
             if self.device == 'cuda':
                 try:
                     model = model.cuda()
-                    torch.set_num_threads(4)
-                    torch.set_num_interop_threads(2)
                     log.info('EQTransformer loaded on CUDA')
                 except Exception as exc:
                     log.warning('CUDA unavailable, falling back to CPU: %s', exc)
+                # Set thread counts separately — these can fail if another PyTorch
+                # model already ran in this process (interop threads are locked after
+                # first use).  Failure here does not affect CUDA availability.
+                try:
+                    torch.set_num_threads(4)
+                except Exception:
+                    pass
+                try:
+                    torch.set_num_interop_threads(2)
+                except Exception:
+                    pass
             self._loaded_model = model
             log.info('EQTransformer ready (pretrained=%s, device=%s)',
                      self.model_path or self.pretrained, self.device)
