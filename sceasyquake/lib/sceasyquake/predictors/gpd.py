@@ -91,11 +91,17 @@ class GPDPredictor:
             if self.device == 'cuda':
                 try:
                     model = model.cuda()
-                    torch.set_num_threads(4)
-                    torch.set_num_interop_threads(2)
                     log.info('GPD loaded on CUDA')
                 except Exception as exc:
                     log.warning('CUDA unavailable, falling back to CPU: %s', exc)
+                try:
+                    torch.set_num_threads(4)
+                except Exception:
+                    pass
+                try:
+                    torch.set_num_interop_threads(2)
+                except Exception:
+                    pass
             self._loaded_model = model
             log.info('GPD ready (weights=%s, device=%s, threshold=%.4f)',
                      self.model_path or self.pretrained, self.device, self.threshold)
@@ -226,6 +232,29 @@ class GPDPredictor:
             st.filter('bandpass', freqmin=1.0, freqmax=20.0, corners=4, zerophase=True)
         except Exception as _exc:
             log.debug('GPD: bandpass filter failed: %s', _exc)
+
+        # Drop stations that lack at least one horizontal component (N/E/1/2).
+        # GPD is a 3-component model; feeding it with only a Z trace fills the
+        # N and E input channels with zeros, which the model misclassifies as S.
+        _HORIZONTAL_SUFFIXES = {'N', 'E', '1', '2'}
+        _sta_has_h = {}
+        for _tr in st:
+            _nsl = (_tr.stats.network, _tr.stats.station, _tr.stats.location)
+            if _tr.stats.channel[-1] in _HORIZONTAL_SUFFIXES:
+                _sta_has_h[_nsl] = True
+            elif _nsl not in _sta_has_h:
+                _sta_has_h[_nsl] = False
+        _dropped_stas = [k for k, v in _sta_has_h.items() if not v]
+        if _dropped_stas:
+            log.debug('GPD: skipping %d Z-only station(s): %s',
+                      len(_dropped_stas),
+                      ', '.join('%s.%s' % (n, s) for n, s, _ in _dropped_stas))
+            from obspy import Stream as _ObspyStream
+            st = _ObspyStream([_tr for _tr in st
+                               if (_tr.stats.network, _tr.stats.station, _tr.stats.location)
+                               not in set(_dropped_stas)])
+            if not st:
+                return []
 
         orig_chan_map = {}
         for tr in st:
