@@ -216,6 +216,17 @@ class GPDPredictor:
         except Exception as _exc:
             log.warning('GPD: SR normalisation failed: %s', _exc)
 
+        # Apply the same bandpass + taper as the native gpd_predict.py so that
+        # the CNN sees the same 1–20 Hz band-limited data it was trained on.
+        # High-frequency content (>20 Hz) confuses filters trained on band-limited data.
+        try:
+            st = st.copy()
+            st.detrend('demean')
+            st.taper(max_percentage=0.05, type='cosine', side='both')
+            st.filter('bandpass', freqmin=1.0, freqmax=20.0, corners=4, zerophase=True)
+        except Exception as _exc:
+            log.debug('GPD: bandpass filter failed: %s', _exc)
+
         orig_chan_map = {}
         for tr in st:
             key = (tr.stats.network, tr.stats.station, tr.stats.location)
@@ -230,6 +241,7 @@ class GPDPredictor:
                 return []
 
         picks = []
+        from obspy.signal.trigger import trigger_onset
         for ann_tr in annotations:
             chan = ann_tr.stats.channel
             # GPD output channels: GPD_P, GPD_S, GPD_N
@@ -242,17 +254,22 @@ class GPDPredictor:
 
             sr = ann_tr.stats.sampling_rate or 1.0
             probs = ann_tr.data.astype(float)
-            min_dist_samples = max(1, int(self.min_distance * sr))
-            peaks, props = find_peaks(
-                probs, height=self.threshold, distance=min_dist_samples
-            )
+
+            # Use trigger_onset (like native gpd_predict.py): one pick per sustained
+            # trigger at the argmax.  find_peaks with small min_distance produces
+            # dozens of picks per seismic phase because GPD probability stays high
+            # throughout the phase energy rather than peaking sharply like PhaseNet.
+            trigs = trigger_onset(probs, self.threshold, 0.1)
 
             nsl_key = (ann_tr.stats.network, ann_tr.stats.station, ann_tr.stats.location)
             orig_cha = orig_chan_map.get(nsl_key, chan[:-(len(phase) + 1)])
 
-            for i, pk in enumerate(peaks):
+            for trig in trigs:
+                if trig[1] <= trig[0]:
+                    continue
+                pk = int(trig[0] + np.argmax(probs[trig[0]:trig[1]]))
+                prob = float(probs[pk])
                 t = ann_tr.stats.starttime + (pk / sr)
-                prob = float(props['peak_heights'][i])
                 picks.append({
                     'network': ann_tr.stats.network,
                     'station': ann_tr.stats.station,

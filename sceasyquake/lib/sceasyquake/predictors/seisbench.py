@@ -154,11 +154,18 @@ class SeisBenchPredictor:
                 if self.device == 'cuda':
                     try:
                         model = model.cuda()
-                        torch.set_num_threads(4)
-                        torch.set_num_interop_threads(2)
                         log.info('%s loaded on CUDA via %s', self.model_name, backend_name)
                     except Exception as exc:
                         log.warning('CUDA unavailable, falling back to CPU: %s', exc)
+                    # Thread counts are set separately — can fail after parallel work started
+                    try:
+                        torch.set_num_threads(4)
+                    except Exception:
+                        pass
+                    try:
+                        torch.set_num_interop_threads(2)
+                    except Exception:
+                        pass
                 self._loaded_model = model
                 self._sbm_module = sbm
                 log.info(
