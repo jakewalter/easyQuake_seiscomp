@@ -159,12 +159,23 @@ seiscomp status sceasyquake
 
 ## Monitoring
 
+`$SEISCOMP_ROOT` must be set for the commands below.  If your shell session
+does not have it, set it once:
+
+```bash
+export SEISCOMP_ROOT=$(seiscomp exec sh -c 'echo $SEISCOMP_ROOT' 2>/dev/null || echo "$HOME/seiscomp")
+```
+
+> The Python log is also always written to `~/.seiscomp/log/sceasyquake_py.log`
+> regardless of `$SEISCOMP_ROOT`, so you can substitute that path directly if
+> preferred.
+
 ### Live log (picks + warnings)
 
 ```bash
 # Filter out noisy debug lines from obspy/matplotlib internals
 grep -v "DEBUG.*obspy.clients.seedlink\|DEBUG.*matplotlib\|DEBUG.*urllib3\|DEBUG.*asyncio\|DEBUG.*font_manager" \
-    $SEISCOMP_ROOT/var/log/sceasyquake_py.log | tail -50
+    ~/.seiscomp/log/sceasyquake_py.log | tail -50
 
 # Follow in real time
 tail -f $SEISCOMP_ROOT/var/log/sceasyquake.log
@@ -173,33 +184,41 @@ tail -f $SEISCOMP_ROOT/var/log/sceasyquake.log
 ### Count picks published this session
 
 ```bash
-grep "Published Pick" $SEISCOMP_ROOT/var/log/sceasyquake_py.log | wc -l
+grep "Published Pick" ~/.seiscomp/log/sceasyquake_py.log | wc -l
 ```
 
 ### List all stations that have produced picks
 
 ```bash
-grep "Published Pick" $SEISCOMP_ROOT/var/log/sceasyquake_py.log \
+grep "Published Pick" ~/.seiscomp/log/sceasyquake_py.log \
     | grep -oP '\w+\.\w+\.\.' | sort -u
 ```
 
 ### Pick rate (picks per minute, last 100 lines)
 
 ```bash
-grep "Published Pick" $SEISCOMP_ROOT/var/log/sceasyquake_py.log \
+grep "Published Pick" ~/.seiscomp/log/sceasyquake_py.log \
     | tail -100 \
     | awk 'NR==1{start=$2} NR==100{end=$2} END{print "~" int(100/((substr(end,1,5)-substr(start,1,5))*60+substr(end,7,2)-substr(start,7,2))) " picks/min"}'
 ```
 
 ### Check picks are reaching the SeisComP database
 
-```bash
-# List recent ML picks (requires scmaster running and database configured)
-scevtls -d "$SEISCOMP_DATABASE" --begin "$(date -u +%Y-%m-%dT%H:%M:%S -d '5 minutes ago')"
+The most reliable way is to query the database directly.  The connection
+details are in `$SEISCOMP_ROOT/etc/global.cfg` (keys `database` and
+`core.plugins`).  For a default MariaDB/MySQL installation:
 
-# Or use scdumppicks to print picks on the messaging bus in real time
-scdumppicks -H localhost
+```bash
+# Adjust host, user, password, and db name to match your global.cfg
+mysql -h 127.0.0.1 -u seiscomp -p seiscomp \
+  -e "SELECT publicID, time_value, phaseHint FROM Pick
+      WHERE creationInfo_agencyID = 'sceasyquake'
+      ORDER BY time_value DESC LIMIT 20;"
 ```
+
+Alternatively, open **scmv** (Map View) or **scolv** (Origin Locator) in the
+SeisComP GUI — picks from `sceasyquake` appear immediately in the waveform
+review panel if `scautoloc` or `scassoc` is associating them.
 
 ### Verify module process is running
 
