@@ -98,6 +98,13 @@ def _make_obspy_seedlink_client(server: str, queue: Queue, stream_specs: List[st
         # An empty string means "any location", which is correct behaviour.
         if loc in ('*', '?', '??', '**'):
             loc = ''
+        # SeedLink wildcard support for NET and STA:
+        #   - '?' works portably (matches exactly one character per '?').
+        #     Use e.g. STA='????' to match all 4-character station codes.
+        #   - '*' is supported by SeisComP's own SeedLink server but is not
+        #     guaranteed by the protocol and may be rejected by other servers.
+        #     Prefer an explicit NET code with '?' patterns for STA instead of
+        #     bare '*.*' to avoid silent subscription failures.
         # SeedLink selector is loc+cha (e.g. '' + 'HHZ' or '' + 'HH?')
         selector = f'{loc}{cha}'
         client.select_stream(net, sta, selector)

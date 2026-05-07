@@ -13,22 +13,17 @@ Config parameters (sceasyquake.cfg):
 
 Role of ``picker.pretrained``
 -----------------------------
-This parameter serves **two different purposes** depending on ``model_path``:
+This parameter is only used when **no** ``model_path`` is set, in which case
+it names the weight set downloaded from the SeisBench hub and used directly
+for inference, e.g. ``stead``, ``original``, ``ethz``.
 
-* **No model_path** (hub weights): ``pretrained`` names the weight set
-  downloaded from the SeisBench model hub and used directly for inference,
-  e.g. ``stead``, ``original``, ``ethz``.
+When ``model_path`` is a raw ``.pt``/``.pth`` state-dict, the hub is never
+contacted.  The model shell is built with the bare constructor using
+``picker.norm`` (default ``peak``); the state-dict fully replaces all weights.
+Set ``picker.norm`` explicitly to match your model's training normalization.
 
-* **model_path = raw .pt/.pth state-dict**: ``pretrained`` names the base
-  architecture template — the model is first constructed via
-  ``from_pretrained(pretrained)`` to capture its norm mode, label layout,
-  sampling rate, and component order, then the weights are immediately
-  replaced by the file in ``model_path``.  The pretrained weights themselves
-  are not used at inference time.  Set this to the weight set whose
-  architecture settings match how your custom model was trained.
-
-* **model_path = SeisBench directory (.pt + .json)**: ``pretrained`` is
-  ignored entirely; all architecture metadata is read from the ``.json``.
+When ``model_path`` is a SeisBench directory (``.pt`` + ``.json``), all
+metadata comes from the ``.json`` and ``picker.pretrained`` is also not used.
 
 Custom weight loading (``model_path`` resolution order)
 -------------------------------------------------------
@@ -91,7 +86,9 @@ class SeisBenchPredictor:
         ----------
         model        : SeisBench model class name (PhaseNet, GPD, EQTransformer).
         pretrained   : pretrained weight set (e.g. 'stead', 'original', 'ethz').
-                       Ignored when *model_path* is provided.
+                       Only used when *model_path* is not set; names the hub
+                       weights used directly for inference.  Ignored for raw
+                       .pt/.pth files and SeisBench save directories.
         model_path   : path to custom weights (raw .pt or seisbench directory).
                        When set, *pretrained* is not used.
         threshold    : default probability threshold for all phases.
@@ -214,23 +211,20 @@ class SeisBenchPredictor:
             # 1. Raw state-dict .pt / .pth file
             if p.suffix in ('.pt', '.pth') and p.is_file():
                 log.info('%s: loading raw state dict from %s', self.model_name, p)
-                # Use the pretrained base model to preserve all metadata
-                # (norm, labels, sampling_rate, component_order, etc.) that
-                # the model was trained against.  The reference inference
-                # workflow (oklad_annotate_workflow) loads from_pretrained
-                # then overwrites weights — we do the same here so that
-                # seisbench's annotate_batch_pre uses the correct settings.
+                # Build the model shell from the bare constructor.
+                # There is no need to call from_pretrained() here: the weights
+                # are about to be fully replaced by the custom state-dict, so
+                # hub weights would be downloaded and immediately discarded.
+                # Architecture metadata (norm, sampling_rate, labels) comes from:
+                #   - picker.norm        → self.norm (applied after load)
+                #   - picker.label_order → self.label_order (output permutation)
+                #   - model class defaults for sampling_rate / component_order
+                init_norm = self.norm if self.norm is not None else 'peak'
                 try:
-                    m = model_cls.from_pretrained(self.pretrained)
-                    log.info('%s: using %s as base for custom weights', self.model_name, self.pretrained)
-                except Exception:
-                    # Fall back to bare constructor if pretrained is unavailable
-                    init_norm = self.norm if self.norm is not None else 'peak'
-                    try:
-                        m = model_cls(norm=init_norm)
-                    except TypeError:
-                        m = model_cls()
-                    log.info('%s: pretrained base unavailable; using bare constructor', self.model_name)
+                    m = model_cls(norm=init_norm)
+                except TypeError:
+                    m = model_cls()
+                log.info('%s: constructed with norm="%s"', self.model_name, init_norm)
                 state = torch.load(str(p), map_location='cpu')
                 # Reorder output layer if the model's training label order differs
                 # from the backend's native label order (seisbench PhaseNet: 'NPS').
@@ -242,12 +236,24 @@ class SeisBenchPredictor:
                         import torch as _torch
                         state['out.weight'] = state['out.weight'][perm]
                         state['out.bias']   = state['out.bias'][perm]
-                        log.info('%s: permuted output layer from %s to %s (perm=%s)',
+                        log.info('%s: reordering output weights from training order %s '
+                                 'to seisbench native order %s (perm=%s)',
                                  self.model_name, self.label_order, native_labels, perm)
                     except (ValueError, KeyError) as exc:
                         log.warning('%s: could not apply label_order permutation: %s',
                                     self.model_name, exc)
                 m.load_state_dict(state)
+                # Override the base model's normalization mode if picker.norm
+                # was explicitly set.  from_pretrained() inherits the base
+                # weight set's norm (e.g. 'std' for stead); custom weights
+                # trained with a different norm (e.g. 'peak') need this to be
+                # corrected *after* load_state_dict so annotate_batch_pre uses
+                # the right amplitude scaling.
+                if self.norm is not None and hasattr(m, 'norm'):
+                    old_norm = getattr(m, 'norm', None)
+                    m.norm = self.norm
+                    log.info('%s: overriding norm %s → %s (picker.norm)',
+                             self.model_name, old_norm, self.norm)
                 return m
 
             # 2. SeisBench-format directory or base path with .json sibling

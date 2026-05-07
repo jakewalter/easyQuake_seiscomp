@@ -38,10 +38,15 @@
 			<parameter name="streams.codes" type="list:string" default="">
 				<description>
 					Comma-separated list of waveform stream selectors in
-					NET.STA.LOC.CHA format (wildcards accepted).
-					Example: CI.*.*.HHZ,CI.*.*.EHZ
-					Leave empty to subscribe to all vertical channels
-					(*.*..??Z).
+					NET.STA.LOC.CHA format.
+					Leave empty to subscribe to all vertical channels (*.*..??Z).
+					SeedLink wildcard notes: NET must be an explicit code (e.g.
+					'CI') — '*' for NET may be silently ignored by some SeedLink
+					servers. STA supports '?' per character (e.g. '????' for all
+					4-character stations); '*' works on SeisComP's SeedLink but is
+					not guaranteed by the protocol. LOC wildcards are converted to
+					an empty string automatically. CHA supports '?' freely.
+					Example: CI.????.*.HH?
 				</description>
 			</parameter>
 

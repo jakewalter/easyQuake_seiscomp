@@ -14,7 +14,8 @@ git clone https://github.com/jwalter/easyQuake_seiscomp.git
 cd easyQuake_seiscomp/sceasyquake
 
 # easyQuake (optional but recommended — bundled seisbench weights + GPD)
-git clone https://github.com/jwalter/easyQuake.git ~/easyQuake
+# Clone wherever you like; adjust the path in the pip install step below.
+git clone https://github.com/jwalter/easyQuake.git /path/to/easyQuake
 ```
 
 ## 2. Identify the SeisComP Python interpreter
@@ -42,9 +43,12 @@ $SC_PYTHON -m pip install obspy scipy numpy PyYAML watchdog psutil
 $SC_PYTHON -m pip install seisbench
 
 # Option B: Full easyQuake package (preferred — bundled weights)
-cd ~/easyQuake && $SC_PYTHON -m pip install -e . && cd -
+cd /path/to/easyQuake && $SC_PYTHON -m pip install -e . && cd -
 
 # GPU acceleration (skip for CPU-only deployments)
+# Replace cu121 with the wheel tag matching your CUDA version:
+#   CUDA 11.8 → cu118   CUDA 12.1 → cu121   CUDA 12.4 → cu124
+# See https://pytorch.org/get-started/locally/ for the current selector.
 $SC_PYTHON -m pip install torch --index-url https://download.pytorch.org/whl/cu121
 $SC_PYTHON -c "import torch; print('CUDA:', torch.cuda.is_available())"
 ```
@@ -60,16 +64,17 @@ The script (with `$SC_PYTHON` exported) will:
 1. Install the sceasyquake package via `$SC_PYTHON -m pip install -e .` (editable — source is live).
 2. Copy `bin/sceasyquake-stream.py` → `$SEISCOMP_ROOT/bin/sceasyquake` with the correct shebang.
 3. Copy `share/descriptions/sceasyquake.xml` → `$SEISCOMP_ROOT/etc/descriptions/` (for `scconfig` UI).
-4. Copy `share/defaults/sceasyquake.cfg` → `$SEISCOMP_ROOT/etc/defaults/` (factory defaults).
-5. Symlink `lib/sceasyquake` into `$SEISCOMP_ROOT/lib/python/` (fallback import path for `seiscomp-python`).
-6. Create `$SEISCOMP_ROOT/etc/sceasyquake.cfg` (user overrides) if absent.
+4. Copy `share/init/sceasyquake.py` → `$SEISCOMP_ROOT/etc/init/` (**required** for `seiscomp enable/start`).
+5. Copy `share/defaults/sceasyquake.cfg` → `$SEISCOMP_ROOT/etc/defaults/` (factory defaults).
+6. Symlink `lib/sceasyquake` into `$SEISCOMP_ROOT/lib/python/` (fallback import path for `seiscomp-python`).
+7. Create `$SEISCOMP_ROOT/etc/sceasyquake.cfg` (user overrides) if absent.
 
 To pass a non-standard SeisComP root:
 ```bash
 bash install.sh /opt/seiscomp
 ```
 
-## 4. Enable and start
+## 5. Enable and start
 
 ```bash
 seiscomp enable sceasyquake
@@ -116,7 +121,14 @@ picker.model_path = /data/models/finetuned.pt
 picker.model_path = /data/models/finetuned
 ```
 
-When `picker.model_path` is set, `picker.pretrained` is ignored.
+When `picker.model_path` points to a raw `.pt`/`.pth` state-dict, the SeisBench
+hub is never contacted — the model is built directly from the bare constructor
+using `picker.norm`, and the state-dict fully replaces the weights. Set
+`picker.norm` to match your model's training normalization (`peak` or `std`).
+`picker.pretrained` is not used.
+
+When `model_path` is a SeisBench save directory (`.pt` + `.json`), all
+metadata comes from the `.json` and `picker.pretrained` is also not used.
 
 ## Capacity Benchmark
 

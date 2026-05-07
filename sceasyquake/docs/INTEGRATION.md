@@ -57,14 +57,27 @@ listens on the `PICK` group regardless of which module produced the picks.
 ## Stream selection
 
 Set `streams.codes` in `$SEISCOMP_ROOT/etc/sceasyquake.cfg` to match the
-streams configured in `scrttv`:
+streams configured in `scrttv`. Replace `NET` with your actual network code.
 
 ```ini
-# All HH and EH vertical channels in network CI
-streams.codes = CI.*.*.HHZ,CI.*.*.EHZ
+# All HH vertical channels — replace NET with your network code (e.g. GE, IU, CI)
+streams.codes = NET.????.*.HH?
+
+# Multiple channel types
+streams.codes = NET.????.*.HHZ,NET.????.*.EHZ
+
+# Explicit station list
+streams.codes = NET.STA1..HHZ,NET.STA2..HHZ
 ```
 
-Wildcards follow SeedLink `NET.STA.LOC.CHA` conventions.
+**SeedLink wildcard notes** — not all wildcards work at every position:
+
+| Field | Safe pattern | Notes |
+|---|---|---|
+| NET | explicit code only | `*` may be silently ignored by some servers |
+| STA | `?` per character, e.g. `????` | `*` works on SeisComP SeedLink but is not in the protocol spec |
+| LOC | empty string (no `*`) | The installer converts `*`/`?` to empty automatically |
+| CHA | `?` freely, e.g. `HH?` or `??Z` | Works as expected |
 
 ## GPU acceleration
 
@@ -80,7 +93,7 @@ Ensure CUDA / cuDNN are installed for the Python environment used by
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | No picks in scmv | Module not started | `seiscomp status sceasyquake` |
-| `import sceasyquake` fails | Package not installed | `pip3 install -e .` |
+| `import sceasyquake` fails | Package not installed | `$SC_PYTHON -m pip install -e /path/to/easyQuake_seiscomp/sceasyquake` |
 | SeedLink connection refused | SeedLink not running | `seiscomp start seedlink` |
 | YAML files accumulate in `~/sceasyquake/picks/` | SeisComP bindings absent | Ensure SC ≥5 Python bindings importable |
 | Very slow inference | GPU not in use | Set `picker.device = cuda` |

@@ -108,7 +108,17 @@ cp "$SCRIPT_DIR/share/descriptions/sceasyquake.xml" "$DESC_DIR/sceasyquake.xml"
 echo "    Installed $DESC_DIR/sceasyquake.xml"
 
 # ---------------------------------------------------------------------------
-# 4. Install the default configuration
+# 4. Install the kernel init script (required for seiscomp enable/start)
+# ---------------------------------------------------------------------------
+echo
+echo "==> Installing kernel init script ..."
+INIT_DIR="$SC_ROOT/etc/init"
+mkdir -p "$INIT_DIR"
+cp "$SCRIPT_DIR/share/init/sceasyquake.py" "$INIT_DIR/sceasyquake.py"
+echo "    Installed $INIT_DIR/sceasyquake.py"
+
+# ---------------------------------------------------------------------------
+# 5. Install the default configuration
 # ---------------------------------------------------------------------------
 echo
 echo "==> Installing default configuration ..."
@@ -117,7 +127,8 @@ mkdir -p "$DEFAULTS_DIR"
 cp "$SCRIPT_DIR/share/defaults/sceasyquake.cfg" "$DEFAULTS_DIR/sceasyquake.cfg"
 echo "    Installed $DEFAULTS_DIR/sceasyquake.cfg"
 
-# ---------------------------------------------------------------------------# 5b. Symlink the Python package into SeisComP's lib/python so that
+# ---------------------------------------------------------------------------
+# 6. Symlink the Python package into SeisComP's lib/python so that
 #     seiscomp-python (which uses system Python, not anaconda) can find it.
 # ---------------------------------------------------------------------------
 echo
@@ -127,7 +138,8 @@ mkdir -p "$SC_PY_LIB"
 ln -sfn "$SCRIPT_DIR/lib/sceasyquake" "$SC_PY_LIB/sceasyquake"
 echo "    Linked $SC_PY_LIB/sceasyquake -> $SCRIPT_DIR/lib/sceasyquake"
 
-# ---------------------------------------------------------------------------# 5. Create a user-editable config if none exists yet
+# ---------------------------------------------------------------------------
+# 7. Create a user-editable config if none exists yet
 # ---------------------------------------------------------------------------
 USER_CFG="$SC_ROOT/etc/sceasyquake.cfg"
 if [[ ! -f "$USER_CFG" ]]; then
@@ -154,7 +166,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Create runtime directories
+# 8. Create runtime directories
 # ---------------------------------------------------------------------------
 echo
 echo "==> Creating runtime directories ..."
@@ -185,5 +197,6 @@ echo "  3. seiscomp update-config sceasyquake"
 echo "  4. seiscomp start sceasyquake"
 echo
 echo "To verify picks are flowing:"
-echo "  scmv  (or)  scamp --print-picks -H localhost"
+echo "  tail -f \$SEISCOMP_ROOT/var/log/sceasyquake.log   (command-line)"
+echo "  scmv                                               (graphical map view)"
 echo "================================================================"

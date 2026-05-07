@@ -40,7 +40,8 @@ git clone https://github.com/jwalter/easyQuake_seiscomp.git
 cd easyQuake_seiscomp/sceasyquake
 
 # easyQuake (optional — bundled weights, recommended)
-git clone https://github.com/jwalter/easyQuake.git ~/easyQuake
+# Clone wherever you like; adjust the path in the pip install step below.
+git clone https://github.com/jwalter/easyQuake.git /path/to/easyQuake
 ```
 
 ### 3. Install Python dependencies
@@ -61,9 +62,12 @@ $SC_PYTHON -m pip install obspy scipy numpy PyYAML watchdog psutil
 $SC_PYTHON -m pip install seisbench
 
 # Option B: Full easyQuake package (preferred — bundled weights + seisbench)
-cd ~/easyQuake && $SC_PYTHON -m pip install -e . && cd -
+cd /path/to/easyQuake && $SC_PYTHON -m pip install -e . && cd -
 
 # GPU support (skip if CPU-only)
+# Replace cu121 with the wheel tag matching your CUDA version:
+#   CUDA 11.8 → cu118   CUDA 12.1 → cu121   CUDA 12.4 → cu124
+# See https://pytorch.org/get-started/locally/ for the current selector.
 $SC_PYTHON -m pip install torch --index-url https://download.pytorch.org/whl/cu121
 $SC_PYTHON -c "import torch; print('CUDA:', torch.cuda.is_available())"
 ```
@@ -107,8 +111,21 @@ conda deactivate
 ```
 
 After creating the environment, set `picker.python_easyquake` in
-`$SEISCOMP_ROOT/etc/sceasyquake.cfg` (or leave it at the default
-`/home/$USER/anaconda3/envs/easyquake/bin/python`).
+`$SEISCOMP_ROOT/etc/sceasyquake.cfg` to the full path of the conda env's Python.
+The path depends on where conda is installed on your system, e.g.:
+
+```ini
+# Anaconda in home directory (common default)
+# picker.python_easyquake = ~/anaconda3/envs/easyquake/bin/python
+
+# Miniconda in home directory
+# picker.python_easyquake = ~/miniconda3/envs/easyquake/bin/python
+
+# System-wide or /opt install
+# picker.python_easyquake = /opt/conda/envs/easyquake/bin/python
+```
+
+Run `conda info --envs` to find the exact path on your machine.
 
 #### Repo-local script patches
 
@@ -155,9 +172,10 @@ seedlink.port = 18000
 ### Stream selection
 
 ```ini
-# Comma-separated NET.STA.LOC.CHA selectors (wildcards OK)
-# Leave empty to subscribe to all vertical channels
-streams.codes = TX.*.00.HHZ, TX.*.00.HHN, TX.*.00.HHE
+# Comma-separated NET.STA.LOC.CHA selectors
+# Replace NET with your network code; use '?' for single-character wildcards in STA.
+# SeedLink note: NET must be explicit; '?' is portable for STA; LOC wildcard = empty.
+streams.codes = NET.????.*.HHZ, NET.????.*.HHN, NET.????.*.HHE
 ```
 
 ### Picker settings
@@ -204,7 +222,14 @@ picker.model_path = /data/models/my_model
 # Expects: /data/models/my_model.pt + /data/models/my_model.json
 ```
 
-When `picker.model_path` is set, `picker.pretrained` is ignored.
+When `picker.model_path` points to a raw `.pt`/`.pth` state-dict, the SeisBench
+hub is never contacted — the model is built directly from the bare constructor
+using `picker.norm`, and the state-dict fully replaces the weights. Set
+`picker.norm` to match your model's training normalization (`peak` or `std`).
+`picker.pretrained` is not used.
+
+When `model_path` is a SeisBench save directory (`.pt` + `.json`), all
+metadata comes from the `.json` and `picker.pretrained` is also not used.
 
 ---
 
@@ -214,7 +239,7 @@ Before deploying to production run the capacity benchmark to measure how many
 streams this machine can pick within one step interval:
 
 ```bash
-cd ~/easyQuake_seiscomp/sceasyquake
+cd /path/to/easyQuake_seiscomp/sceasyquake
 
 # Test 20 stations on CPU then GPU for 60 s each
 python tests/bench_picker_capacity.py --channels 20 --step-seconds 5
