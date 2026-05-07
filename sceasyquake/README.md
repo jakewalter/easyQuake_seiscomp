@@ -157,6 +157,59 @@ seiscomp status sceasyquake
 
 ---
 
+## Monitoring
+
+### Live log (picks + warnings)
+
+```bash
+# Filter out noisy debug lines from obspy/matplotlib internals
+grep -v "DEBUG.*obspy.clients.seedlink\|DEBUG.*matplotlib\|DEBUG.*urllib3\|DEBUG.*asyncio\|DEBUG.*font_manager" \
+    $SEISCOMP_ROOT/var/log/sceasyquake_py.log | tail -50
+
+# Follow in real time
+tail -f $SEISCOMP_ROOT/var/log/sceasyquake.log
+```
+
+### Count picks published this session
+
+```bash
+grep "Published Pick" $SEISCOMP_ROOT/var/log/sceasyquake_py.log | wc -l
+```
+
+### List all stations that have produced picks
+
+```bash
+grep "Published Pick" $SEISCOMP_ROOT/var/log/sceasyquake_py.log \
+    | grep -oP '\w+\.\w+\.\.' | sort -u
+```
+
+### Pick rate (picks per minute, last 100 lines)
+
+```bash
+grep "Published Pick" $SEISCOMP_ROOT/var/log/sceasyquake_py.log \
+    | tail -100 \
+    | awk 'NR==1{start=$2} NR==100{end=$2} END{print "~" int(100/((substr(end,1,5)-substr(start,1,5))*60+substr(end,7,2)-substr(start,7,2))) " picks/min"}'
+```
+
+### Check picks are reaching the SeisComP database
+
+```bash
+# List recent ML picks (requires scmaster running and database configured)
+scevtls -d "$SEISCOMP_DATABASE" --begin "$(date -u +%Y-%m-%dT%H:%M:%S -d '5 minutes ago')"
+
+# Or use scdumppicks to print picks on the messaging bus in real time
+scdumppicks -H localhost
+```
+
+### Verify module process is running
+
+```bash
+seiscomp status sceasyquake
+ps aux | grep sceasyquake
+```
+
+---
+
 ## Configuration
 
 Edit `$SEISCOMP_ROOT/etc/sceasyquake.cfg` directly **or** open `scconfig`
