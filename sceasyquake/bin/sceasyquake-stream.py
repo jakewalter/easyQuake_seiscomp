@@ -88,8 +88,13 @@ class _SeiscompLogHandler(logging.Handler):
 def _install_sc_log_bridge():
     """Redirect all Python logging to a dedicated log file and SeisComP's log."""
     import os
+    from logging.handlers import RotatingFileHandler
     log_path = os.path.expanduser('~/.seiscomp/log/sceasyquake_py.log')
-    file_handler = logging.FileHandler(log_path, mode='a')
+    # Rotate at 50 MB, keep 5 backups → max ~300 MB on disk.
+    file_handler = RotatingFileHandler(
+        log_path, mode='a', maxBytes=50 * 1024 * 1024, backupCount=5,
+        encoding='utf-8',
+    )
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s %(levelname)-8s %(name)s: %(message)s'
     ))
@@ -98,7 +103,13 @@ def _install_sc_log_bridge():
     root = logging.getLogger()
     root.addHandler(file_handler)
     root.addHandler(sc_handler)
-    root.setLevel(logging.DEBUG)
+    # Keep root at INFO so verbose third-party libraries (e.g. obspy SeedLink,
+    # which emits a DEBUG line for *every* poll loop iteration) don't flood the
+    # log file.  sceasyquake's own loggers are lowered to DEBUG below.
+    root.setLevel(logging.INFO)
+    logging.getLogger('sceasyquake').setLevel(logging.DEBUG)
+    # Suppress obspy SeedLink DEBUG spam (primary loop pass 0, state 2, etc.)
+    logging.getLogger('obspy.clients.seedlink').setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +473,9 @@ if HAS_SEISCOMP:
             except Exception as exc:
                 log.warning('Could not pre-load model: %s', exc)
 
-            worker = StreamWorker(predictor, uploader, buffer_seconds=buffer_sec, step_seconds=step_sec)
+            max_batch = int(self._cfg('picker.max_batch_stations', '64'))
+            worker = StreamWorker(predictor, uploader, buffer_seconds=buffer_sec,
+                                  step_seconds=step_sec, max_batch_stations=max_batch)
             src = SeisCompStream(
                 seedlink_url=f'{seedlink_host}:{seedlink_port}',
                 stream_specs=stream_specs,

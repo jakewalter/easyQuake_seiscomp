@@ -36,12 +36,12 @@ to `scautopick`.
 
 ```bash
 # sceasyquake (this module)
-git clone https://github.com/jwalter/easyQuake_seiscomp.git
+git clone https://github.com/jakewalter/easyQuake_seiscomp.git
 cd easyQuake_seiscomp/sceasyquake
 
 # easyQuake (optional — bundled weights, recommended)
 # Clone wherever you like; adjust the path in the pip install step below.
-git clone https://github.com/jwalter/easyQuake.git /path/to/easyQuake
+git clone https://github.com/jakewalter/easyQuake.git /path/to/easyQuake
 ```
 
 ### 3. Install Python dependencies

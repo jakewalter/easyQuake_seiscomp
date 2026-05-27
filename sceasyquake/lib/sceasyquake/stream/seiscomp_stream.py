@@ -14,6 +14,7 @@ For unit-testing, `FakeStream` yields a predefined sequence of `Trace` objects.
 """
 
 import logging
+import time
 import threading
 from queue import Queue, Empty
 from typing import Iterable, List, Optional
@@ -149,31 +150,52 @@ class SeisCompStream:
     # Public interface
     # ------------------------------------------------------------------
 
-    def connect(self):
-        """Connect to SeedLink server and start receiving in a daemon thread."""
+    def connect(self, retry_timeout: float = 60.0, retry_interval: float = 5.0):
+        """Connect to SeedLink server and start receiving in a daemon thread.
+
+        If the initial connection is refused (e.g. SeedLink still starting up),
+        retries every *retry_interval* seconds for up to *retry_timeout* seconds
+        before giving up.
+        """
         # Allow tests to inject a fake client by pre-populating self._client
         if self._client is not None:
             log.info('SeisCompStream: using pre-injected client')
             return
 
-        try:
-            self._client = _make_obspy_seedlink_client(
-                self.seedlink_url, self._queue, self.stream_specs
-            )
-            self._thread = threading.Thread(
-                target=self._client.run,
-                name='sceasyquake-seedlink',
-                daemon=True,
-            )
-            self._thread.start()
-            log.info(
-                'SeisCompStream connected to %s (%d stream specs)',
-                self.seedlink_url,
-                len(self.stream_specs),
-            )
-        except Exception as exc:
-            log.error('SeisCompStream.connect() failed: %s', exc)
-            self._client = None
+        deadline = time.monotonic() + retry_timeout
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self._client = _make_obspy_seedlink_client(
+                    self.seedlink_url, self._queue, self.stream_specs
+                )
+                self._thread = threading.Thread(
+                    target=self._client.run,
+                    name='sceasyquake-seedlink',
+                    daemon=True,
+                )
+                self._thread.start()
+                log.info(
+                    'SeisCompStream connected to %s (%d stream specs)',
+                    self.seedlink_url,
+                    len(self.stream_specs),
+                )
+                return
+            except Exception as exc:
+                self._client = None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.error(
+                        'SeisCompStream.connect() failed after %d attempt(s): %s',
+                        attempt, exc,
+                    )
+                    return
+                log.warning(
+                    'SeisCompStream.connect() attempt %d failed (%s); retrying in %.0fs',
+                    attempt, exc, retry_interval,
+                )
+                time.sleep(min(retry_interval, remaining))
 
     def get_next_trace(self, timeout: float = 1.0):
         """Return next ObsPy Trace from the buffer, or None on timeout."""
@@ -182,6 +204,15 @@ class SeisCompStream:
         except Empty:
             return None
 
+    def is_connected(self) -> bool:
+        """Return True if the SeedLink receiver thread is alive."""
+        return self._thread is not None and self._thread.is_alive()
+
+    def reconnect(self):
+        """Tear down any existing connection and reconnect with retry logic."""
+        self.disconnect()
+        self.connect()
+
     def disconnect(self):
         if self._client is not None:
             try:
@@ -189,6 +220,7 @@ class SeisCompStream:
             except Exception:
                 pass
             self._client = None
+        self._thread = None
         log.info('SeisCompStream disconnected')
 
     # Convenience: let the worker inject a fake client for testing
