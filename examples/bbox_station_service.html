@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>SeisComP Station Selector</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a2e; }
+        #map { width: 100%; height: 100vh; }
+
+        /* station chip bar */
+        #results {
+            position: fixed; bottom: 0; left: 0; right: 0;
+            max-height: 110px; overflow-y: auto;
+            background: rgba(10,10,24,0.88); backdrop-filter: blur(6px);
+            padding: 6px 10px; display: flex; flex-wrap: wrap; gap: 4px;
+            border-top: 1px solid #333;
+            z-index: 900;
+        }
+        .sta-chip {
+            font-size: 11px; padding: 2px 8px; border-radius: 12px;
+            color: #fff; cursor: default; white-space: nowrap; letter-spacing: 0.3px;
+        }
+        .primary   { background: #1a6b35; border: 1px solid rgba(46,242,122,0.27); }
+        .secondary { background: #1a3a6b; border: 1px solid rgba(46,135,242,0.27); }
+        .existing  { opacity: 0.5; cursor: not-allowed; }
+        .selectable { cursor: pointer; }
+        .selected  { box-shadow: 0 0 0 2px #ffd700; }
+
+        /* progress panel */
+        #progress-panel {
+            position: fixed; top: 60px; right: 16px; width: 320px;
+            background: rgba(14,14,30,0.97); backdrop-filter: blur(10px);
+            border: 1px solid #2a2a50; border-radius: 10px;
+            padding: 14px 16px; z-index: 1000;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+            transform: translateX(360px);
+            transition: transform 0.35s cubic-bezier(.22,.8,.37,1), opacity 0.3s;
+            opacity: 0;
+        }
+        #progress-panel.visible { transform: translateX(0); opacity: 1; }
+
+        #progress-title {
+            font-size: 13px; font-weight: 600; color: #a0c4ff;
+            margin-bottom: 10px; letter-spacing: 0.5px;
+        }
+        .step-row {
+            display: flex; align-items: flex-start; gap: 9px;
+            margin: 5px 0; font-size: 12px; color: #999;
+            transition: color 0.2s;
+        }
+        .step-row.done   { color: #5bf5a0; }
+        .step-row.active { color: #fff; }
+        .step-row.error  { color: #f56b5b; }
+        .step-icon { width: 18px; text-align: center; font-size: 13px; flex-shrink: 0; padding-top: 1px; }
+        .step-label { flex: 1; line-height: 1.4; }
+        .step-row.error .step-label { cursor: pointer; text-decoration: underline dotted rgba(245,107,91,0.5); }
+
+        .step-detail {
+            margin: 2px 0 5px 27px;
+            padding: 5px 8px;
+            background: rgba(245,90,80,0.07);
+            border-left: 2px solid rgba(245,107,91,0.5);
+            border-radius: 3px;
+            font-size: 10.5px; color: #e08070;
+            white-space: pre-wrap; word-break: break-all;
+            max-height: 90px; overflow-y: auto;
+            font-family: monospace;
+        }
+
+        .spin {
+            display: inline-block; width: 13px; height: 13px;
+            border: 2px solid #444; border-top-color: #7eb8ff;
+            border-radius: 50%; animation: spin 0.7s linear infinite;
+            vertical-align: middle;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        #hint {
+            position: fixed; bottom: 125px; left: 50%;
+            transform: translateX(-50%);
+            background: rgba(14,14,30,0.85); color: #8ab4f8;
+            padding: 7px 18px; border-radius: 20px; font-size: 13px;
+            pointer-events: none; border: 1px solid #2a2a50;
+            transition: opacity 0.4s; z-index: 800;
+        }
+    </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="hint">&#x1F5FA; Draw a rectangle to discover and import streaming stations</div>
+<div id="progress-panel">
+    <div id="progress-title">SeisComP Station Import</div>
+    <div id="steps"></div>
+    <div style="margin-top:8px; font-size:11px; color:#ccc;">
+        <label><input type="checkbox" id="detailed-toggle"> Detailed output</label>
+    </div>
+</div>
+<div id="status" style="position:fixed;bottom:150px;left:20px;padding:6px 10px;background:rgba(14,14,30,0.9);color:#fff;font-size:13px;z-index:910;border-radius:6px;">Ready</div>
+<div id="detailed-output" style="display:none;position:fixed;bottom:50px;left:20px;right:20px;height:120px;background:rgba(0,0,0,0.85);color:#eee;overflow:auto;font-size:11px;padding:6px;z-index:920;white-space:pre-wrap;">
+    <pre id="details" style="margin:0;"></pre>
+</div>
+<div id="results"></div>
+<button id="apply-btn" disabled style="position:fixed;bottom:120px;right:20px;padding:8px 14px;font-size:13px;z-index:910;">Apply selected stations</button>
+
+<script>
+// map
+var map = L.map('map').setView([32, -98], 5);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors', maxZoom: 18
+}).addTo(map);
+var drawnItems = new L.FeatureGroup().addTo(map);
+var markers    = new L.FeatureGroup().addTo(map);
+
+var drawControl = new L.Control.Draw({
+    draw: {
+        rectangle: { shapeOptions: { color: '#7eb8ff' } },
+        polyline: false, polygon: false, circle: false,
+        marker: false, circlemarker: false
+    },
+    edit: { featureGroup: drawnItems }
+});
+map.addControl(drawControl);
+
+// progress panel
+var panel = document.getElementById('progress-panel');
+var stepEls = {};
+
+var STEPS = [
+    { id: 'fdsn',     label: 'Querying FDSN catalog' },
+    { id: 'seedlink', label: 'Checking Seedlink servers' },
+    { id: 'found',    label: 'Stations found' },
+    { id: 'inv',      label: 'Writing inventory to SeisComP' },
+    { id: 'keys',     label: 'Writing binding key files' },
+    { id: 'scinv',    label: 'scinv sync' },
+    { id: 'cfg',      label: 'Updating module configs' },
+    { id: 'restart',  label: 'Restarting seedlink' },
+    { id: 'stream',   label: 'Verifying stream data' }
+];
+
+function buildPanel() {
+    document.getElementById('steps').innerHTML = '';
+    document.getElementById('progress-title').textContent = 'SeisComP Station Import';
+    document.getElementById('progress-title').style.color = '#a0c4ff';
+    stepEls = {};
+    STEPS.forEach(function(s) {
+        var row = document.createElement('div');
+        row.className = 'step-row';
+        row.id = 'step-' + s.id;
+        var icon  = document.createElement('span'); icon.className  = 'step-icon'; icon.textContent = '\u25E6';
+        var label = document.createElement('span'); label.className = 'step-label'; label.textContent = s.label;
+        row.appendChild(icon);
+        row.appendChild(label);
+        document.getElementById('steps').appendChild(row);
+        stepEls[s.id] = row;
+    });
+    panel.classList.add('visible');
+    document.getElementById('hint').style.opacity = '0';
+}
+
+function stepActive(id) {
+    var row = stepEls[id]; if (!row) return;
+    row.className = 'step-row active';
+    row.querySelector('.step-icon').innerHTML = '<span class="spin"></span>';
+}
+
+function stepDone(id, note) {
+    var row = stepEls[id]; if (!row) return;
+    row.className = 'step-row done';
+    row.querySelector('.step-icon').textContent = '\u2713';
+    var base = STEPS.find(function(s) { return s.id === id; }).label;
+    row.querySelector('.step-label').textContent = note ? base + '  \u2014  ' + note : base;
+}
+
+function stepError(id, note, detail) {
+    var row = stepEls[id]; if (!row) return;
+    row.className = 'step-row error';
+    row.querySelector('.step-icon').textContent = '\u2715';
+    var base  = STEPS.find(function(s) { return s.id === id; }).label;
+    var lbl   = row.querySelector('.step-label');
+    lbl.textContent = note ? base + '  \u2014  ' + note : base;
+    if (detail && detail.trim()) {
+        var det = document.createElement('div');
+        det.className = 'step-detail';
+        det.textContent = detail.trim();
+        lbl.textContent += '  (click to expand)';
+        lbl.addEventListener('click', function() {
+            det.style.display = det.style.display === 'none' ? 'block' : 'none';
+        });
+        row.parentNode.insertBefore(det, row.nextSibling);
+    }
+}
+
+function panelSuccess(msg) {
+    var t = document.getElementById('progress-title');
+    t.style.color = '#5bf5a0';
+    t.textContent = '\u2713  ' + msg;
+    setTimeout(function() { panel.style.opacity = '0.4'; }, 6000);
+}
+
+function panelFail(msg) {
+    var t = document.getElementById('progress-title');
+    t.style.color = '#f56b5b';
+    t.textContent = '\u2715  ' + msg;
+}
+
+// demand-based detailed output toggle
+var streamResults = [];
+document.getElementById('detailed-toggle').addEventListener('change', function() {
+    document.getElementById('detailed-output').style.display = this.checked ? 'block' : 'none';
+});
+
+function processApplyEvent(ev) {
+    // keep a copy for summary
+    streamResults.push(ev);
+    if (ev.step === 'write_inventory') {
+        stepDone('inv');
+    } else if (ev.step === 'write_key_files') {
+        if (ev.skipped && ev.skipped.length) {
+            var skipDetail = ev.skipped.map(function(e){ return e.station+': '+e.error; }).join('\n');
+            stepError('keys', ev.written + ' written, ' + ev.skipped.length + ' failed', skipDetail);
+        } else {
+            stepDone('keys', ev.written + ' written');
+        }
+    } else if (ev.cmd && ev.cmd.indexOf('scinv') === 0) {
+        if (ev.rc === 0) stepDone('scinv');
+        else stepError('scinv', 'rc=' + ev.rc, ev.stderr || ev.stdout || ev.error || '');
+    } else if (ev.cmd && ev.cmd.indexOf('update-config') !== -1) {
+        if (ev.rc === 0) {
+            stepDone('cfg', 'seedlink + slarchive');
+        } else {
+            stepError('cfg', 'rc=' + ev.rc, ev.stderr || ev.stdout || ev.error || '');
+        }
+    } else if (ev.cmd && ev.cmd.indexOf('restart') !== -1) {
+        if (ev.rc === 0) stepDone('restart');
+        else stepError('restart', 'rc=' + ev.rc, ev.stderr || ev.stdout || ev.error || '');
+    } else if (ev.step === 'stream') {
+        if (ev.error) {
+            stepError('stream', 'check failed', ev.error);
+        } else if (ev.stations && ev.stations.length > 0) {
+            var ok = ev.stations.filter(function(x){ return typeof x === 'string'; });
+            var err = ev.stations.filter(function(x){ return typeof x !== 'string'; });
+            var note = ok.length + ' station' + (ok.length===1?'':'s') + ' active';
+            if (err.length) note += ', ' + err.length + ' had errors';
+            stepDone('stream', note);
+            if (ev.window || err.length) {
+                var detail = ev.window ? 'checked window '+ev.window : '';
+                if (err.length) {
+                    detail += '\n' + err.map(function(e){ return e.station+': '+e.error; }).join('\n');
+                }
+                stepError('stream', '', detail);
+            }
+        } else {
+            var detail = ev.window ? 'window '+ev.window : '';
+            stepError('stream','no data', detail);
+        }
+    }
+}
+
+function startStreamingApply(filtered, stationxml) {
+    streamResults = [];
+    stepActive('inv');
+    var detailsEl = document.getElementById('details');
+    if (detailsEl) detailsEl.textContent = '';
+    fetch('/apply', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({stations: filtered, stationxml: stationxml})
+    }).then(function(r) {
+        var reader = r.body.getReader();
+        var decoder = new TextDecoder();
+        var buf = '';
+        function pump() {
+            return reader.read().then(function(result) {
+                if (result.done) {
+                    // finalize summary
+                    var anyFail = streamResults.filter(function(r){ return r.rc !== undefined && r.rc !== 0; });
+                    if (anyFail.length === 0) {
+                        panelSuccess('All ' + filtered.length + ' stations streaming');
+                    } else {
+                        panelFail(anyFail.length + ' step(s) had errors');
+                        console.warn('failed steps', anyFail);
+                    }
+                    return;
+                }
+                var chunk = decoder.decode(result.value, {stream:true});
+                // always keep raw text for potential debugging
+                if (document.getElementById('detailed-toggle').checked && detailsEl) {
+                    detailsEl.textContent += chunk;
+                    detailsEl.scrollTop = detailsEl.scrollHeight;
+                }
+                buf += chunk;
+                var parts = buf.split('\n');
+                buf = parts.pop();
+                parts.forEach(function(line) {
+                    if (!line) return;
+                    try { var ev = JSON.parse(line); }
+                    catch(e) { return; }
+                    processApplyEvent(ev);
+                });
+                return pump();
+            });
+        }
+        return pump();
+    }).catch(function(err){ panelFail(String(err)); console.error(err); });
+}
+
+// draw event
+map.on(L.Draw.Event.CREATED, function(e) {
+    drawnItems.clearLayers();
+    drawnItems.addLayer(e.layer);
+    markers.clearLayers();
+    document.getElementById('results').innerHTML = '';
+    panel.style.opacity = '1';
+    buildPanel();
+
+    var b    = e.layer.getBounds();
+    var bbox = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()];
+
+    stepActive('fdsn');
+    stepActive('seedlink');
+
+    fetch('/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bbox: bbox })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        if (data.error) {
+            stepError('fdsn', data.error);
+            stepError('seedlink', '');
+            panelFail('Query failed');
+            return Promise.reject('query_error');
+        }
+
+        stepDone('fdsn', 'IRIS FDSN');
+        stepDone('seedlink', 'primary + secondary');
+
+        var n = data.stations.length;
+        if (n === 0) {
+            stepError('found', 'no matching streaming stations');
+            panelFail('No streaming stations found in box');
+            return Promise.reject('no_stations');
+        }
+        stepDone('found', n + ' station' + (n === 1 ? '' : 's'));
+        var existingCount = data.stations.filter(function(s){ return s.present; }).length;
+        var newCount = n - existingCount;
+        setStatus(newCount + ' new, ' + existingCount + ' already present. Select to add');
+
+        var html = '';
+        data.stations.forEach(function(s) {
+            var label = s.network + '.' + s.station;
+            var cls   = s.source === 'primary' ? 'primary' : 'secondary';
+            if (s.present) {
+                cls += ' existing';
+            } else {
+                cls += ' selectable selected';
+            }
+            html += '<span class="sta-chip ' + cls + '" data-code="' + label + '" data-present="' + s.present + '" title="' +
+                    s.source + ' seedlink (' + s.latitude.toFixed(2) + ', ' +
+                    s.longitude.toFixed(2) + ')">' + label + '</span>';
+            L.circleMarker([s.latitude, s.longitude], {
+                radius: 6,
+                color:       s.source === 'primary' ? '#2ef27a' : '#2e87f2',
+                fillColor:   s.source === 'primary' ? '#1a6b35' : '#1a3a6b',
+                weight: 1.5, fillOpacity: 0.85
+            }).bindPopup(
+                '<b>' + label + '</b><br>' +
+                '<span style="color:#888">' + s.source + ' seedlink</span><br>' +
+                s.latitude.toFixed(3) + ',&nbsp;' + s.longitude.toFixed(3)
+            ).addTo(markers);
+        });
+        document.getElementById('results').innerHTML = html;
+        setStatus('Click non‑gray chips to choose which new stations to add, then hit the button.');
+        // add click handlers to chips for selection
+        document.querySelectorAll('#results .sta-chip').forEach(function(chip) {
+            if (chip.getAttribute('data-present') === 'true') return;
+            chip.addEventListener('click', function() {
+                chip.classList.toggle('selected');
+                updateApplyButton();
+            });
+        });
+        updateApplyButton();
+        if (document.querySelectorAll('#results .sta-chip.selected').length === 0) {
+            setStatus('No new stations to add.');
+        }
+
+        // Store for deferred apply; user will choose stations then click the button
+        window.lastStations   = data.stations;
+        window.lastStationXML = data.stationxml;
+        return null;    
+    })
+    .then(function(r) { if (!r) return null; return r.json(); })
+    .then(function(applyData) {
+        if (!applyData) return;
+        if (applyData.error) {
+            stepError('inv', applyData.error);
+            panelFail('Binding failed');
+            return;
+        }
+        if (applyData.applied === 0) {
+            panelSuccess('No new stations to add');
+            return;
+        }
+
+        var res    = applyData.results;
+        var byStep = {};
+        res.forEach(function(r) { if (r.step) byStep[r.step] = r; });
+
+        // inventory
+        if (byStep['write_inventory']) {
+            stepDone('inv');
+        } else {
+            stepError('inv', 'write failed');
+        }
+
+        // key files
+        var kf = byStep['write_key_files'];
+        if (kf) {
+            if (kf.skipped && kf.skipped.length) {
+                var skipDetail = kf.skipped.map(function(e) {
+                    return e.station + ': ' + e.error;
+                }).join('\n');
+                stepError('keys', kf.written + ' written, ' + kf.skipped.length + ' failed', skipDetail);
+            } else {
+                stepDone('keys', kf.written + ' written');
+            }
+        } else {
+            stepError('keys', 'no result');
+        }
+
+        // scinv sync
+        var scinvR = res.find(function(r) { return r.cmd && r.cmd.indexOf('scinv') === 0; });
+        if (scinvR && scinvR.rc === 0) {
+            stepDone('scinv');
+        } else {
+            stepError('scinv',
+                scinvR ? 'rc=' + scinvR.rc : 'not run',
+                scinvR ? (scinvR.stderr || scinvR.stdout || scinvR.error || '') : '');
+        }
+
+        // update-config
+        var cfgAll  = res.filter(function(r) { return r.cmd && r.cmd.indexOf('update-config') !== -1; });
+        var cfgFail = cfgAll.filter(function(r) { return r.rc !== 0; });
+        if (cfgFail.length === 0) {
+            stepDone('cfg', 'seedlink + slarchive');
+        } else {
+            var cfgDetail = cfgFail.map(function(r) {
+                return r.cmd + '\nrc=' + r.rc + '\n' + (r.stderr || r.stdout || r.error || '');
+            }).join('\n---\n');
+            stepError('cfg', cfgFail.length + ' error(s)', cfgDetail);
+        }
+
+        // restart
+        var rstR = res.find(function(r) { return r.cmd && r.cmd.indexOf('restart') !== -1; });
+        if (rstR && rstR.rc === 0) {
+            stepDone('restart');
+        } else {
+            stepError('restart',
+                rstR ? 'rc=' + rstR.rc : 'not run',
+                rstR ? (rstR.stderr || rstR.stdout || rstR.error || '') : '');
+        }
+
+        // data streaming check
+        var streamR = res.find(function(r){ return r.step === 'stream'; });
+        if (streamR) {
+            if (streamR.error) {
+                stepError('stream','check failed', streamR.error);
+            } else if (streamR.stations && streamR.stations.length>0) {
+                // stations array might include objects with errors
+                var ok = streamR.stations.filter(function(x){ return typeof x === 'string'; });
+                var err = streamR.stations.filter(function(x){ return typeof x !== 'string'; });
+                var note = ok.length + ' station' + (ok.length===1?'':'s') + ' active';
+                if (err.length) {
+                    note += ', ' + err.length + ' had errors';
+                }
+                stepDone('stream', note);
+                if (streamR.window) {
+                    var detail = 'checked window ' + streamR.window;
+                    if (err.length) {
+                        detail += '\n' + err.map(function(e){ return e.station+': '+e.error; }).join('\n');
+                    }
+                    stepError('stream', '', detail); // attach detail as expandable
+                }
+            } else {
+                var detail = streamR.window ? 'window '+streamR.window : '';
+                stepError('stream', 'no data', detail);
+            }
+        } else {
+            stepError('stream', 'no check');
+        }
+
+        var anyFail = res.filter(function(r) { return r.rc !== undefined && r.rc !== 0; });
+        if (anyFail.length === 0) {
+            panelSuccess('All ' + applyData.applied + ' stations streaming');
+        } else {
+            panelFail(anyFail.length + ' step(s) had errors');
+            console.warn('failed steps', anyFail);
+        }
+        console.log('apply details', res);
+    })
+    .catch(function(err) {
+        if (err !== 'query_error' && err !== 'no_stations') {
+            panelFail(String(err));
+            console.error(err);
+        }
+    });
+});
+
+// status helper
+function setStatus(msg) {
+    var s = document.getElementById('status');
+    if (s) s.textContent = msg;
+}
+
+// manage apply button
+function updateApplyButton() {
+    var selected = document.querySelectorAll('#results .sta-chip.selected').length;
+    var btn = document.getElementById('apply-btn');
+    btn.disabled = selected === 0;
+}
+
+document.getElementById('apply-btn').addEventListener('click', function() {
+    var selectedCodes = Array.from(document.querySelectorAll('#results .sta-chip.selected'))
+        .map(function(chip){ return chip.getAttribute('data-code'); });
+    if (selectedCodes.length === 0) return;
+    var filtered = (window.lastStations || []).filter(function(s){
+        return selectedCodes.indexOf(s.network + '.' + s.station) !== -1;
+    });
+    if (filtered.length === 0) {
+        setStatus('No stations selected to apply.');
+        return;
+    }
+    // Reset only the apply-phase steps; leave fdsn / seedlink / found as they were
+    ['inv', 'keys', 'scinv', 'cfg', 'restart', 'stream'].forEach(function(id) {
+        var row = stepEls[id]; if (!row) return;
+        // remove any lingering detail block
+        var sibling = row.nextSibling;
+        if (sibling && sibling.classList && sibling.classList.contains('step-detail')) {
+            sibling.parentNode.removeChild(sibling);
+        }
+        row.className = 'step-row';
+        row.querySelector('.step-icon').textContent = '\u25E6';
+        row.querySelector('.step-label').textContent = STEPS.find(function(s){return s.id===id;}).label;
+    });
+    document.getElementById('progress-title').textContent = 'SeisComP Station Import';
+    document.getElementById('progress-title').style.color = '#a0c4ff';
+    panel.style.opacity = '1';
+    panel.classList.add('visible');
+    startStreamingApply(filtered, window.lastStationXML);
+});
+</script>
+</body>
+</html>

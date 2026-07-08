@@ -1,0 +1,5 @@
+# gap_recovery dependencies
+# These are in addition to the main sceasyquake + quakeportal requirements.
+obspy>=1.4
+seisbench>=0.4
+torch>=2.0

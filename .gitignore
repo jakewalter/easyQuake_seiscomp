@@ -4,6 +4,12 @@
 # ...except these
 !/.gitignore
 !/sceasyquake/
+!/examples/
+!/scphasepapy/
+!/scpyocto/
+!/gap_recovery/
+!/archive_cleanup.sh
+!/associator_status.sh
 
 # Python artifacts inside sceasyquake
 sceasyquake/__pycache__/
@@ -12,6 +18,32 @@ sceasyquake/**/*.py[cod]
 sceasyquake/**/*.egg-info/
 sceasyquake/.pytest_cache/
 sceasyquake/**/.pytest_cache/
+
+# Python artifacts inside examples
+examples/__pycache__/
+examples/**/__pycache__/
+examples/**/*.py[cod]
+
+# Python artifacts inside scphasepapy / scpyocto
+scphasepapy/__pycache__/
+scphasepapy/**/__pycache__/
+scphasepapy/**/*.py[cod]
+scphasepapy/**/*.egg-info/
+scphasepapy/.pytest_cache/
+scphasepapy/**/.pytest_cache/
+scpyocto/__pycache__/
+scpyocto/**/__pycache__/
+scpyocto/**/*.py[cod]
+scpyocto/**/*.egg-info/
+scpyocto/.pytest_cache/
+scpyocto/**/.pytest_cache/
+
+# gap_recovery: track the source, never the runtime logs (multi-GB)
+gap_recovery/__pycache__/
+gap_recovery/logs/
+
+# generated snapshot/comparison output from examples/status_check.py
+/seiscomp_snapshots/
 
 # IDEs / OS
 .vscode/

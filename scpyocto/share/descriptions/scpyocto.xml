@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<seiscomp>
+	<module name="scpyocto" category="Processing" inherit-global-bindings="false">
+		<description>
+			PyOcto phase associator for SeisComP. Receives picks from the PICK
+			messaging group and associates them into origins using the PyOcto
+			space-partitioning algorithm.
+		</description>
+
+		<configuration>
+			<!-- Bounding box -->
+			<parameter name="pyocto.lat_min" type="double" default="28.0">
+				<description>Minimum latitude of the search area (degrees)</description>
+			</parameter>
+			<parameter name="pyocto.lat_max" type="double" default="38.0">
+				<description>Maximum latitude of the search area (degrees)</description>
+			</parameter>
+			<parameter name="pyocto.lon_min" type="double" default="-107.0">
+				<description>Minimum longitude of the search area (degrees)</description>
+			</parameter>
+			<parameter name="pyocto.lon_max" type="double" default="-93.0">
+				<description>Maximum longitude of the search area (degrees)</description>
+			</parameter>
+			<parameter name="pyocto.depth_min" type="double" default="0.0">
+				<description>Minimum depth of the search area (km)</description>
+			</parameter>
+			<parameter name="pyocto.depth_max" type="double" default="50.0">
+				<description>Maximum depth of the search area (km)</description>
+			</parameter>
+
+			<!-- Homogeneous 0D velocity model -->
+			<parameter name="pyocto.vp" type="double" default="6.0">
+				<description>P wave velocity for the 0D homogeneous model (km/s)</description>
+			</parameter>
+			<parameter name="pyocto.vs" type="double" default="3.46">
+				<description>S wave velocity for the 0D homogeneous model (km/s)</description>
+			</parameter>
+			<parameter name="pyocto.tolerance" type="double" default="2.0">
+				<description>Velocity model tolerance (s)</description>
+			</parameter>
+
+			<!-- Association parameters -->
+			<parameter name="pyocto.time_before" type="double" default="300.0">
+				<description>Overlap between consecutive time slices (s). Should exceed the travel time across the network.</description>
+			</parameter>
+			<parameter name="pyocto.n_picks" type="int" default="6">
+				<description>Minimum total number of picks required to declare an event</description>
+			</parameter>
+			<parameter name="pyocto.n_p_picks" type="int" default="3">
+				<description>Minimum number of P picks required per event</description>
+			</parameter>
+			<parameter name="pyocto.n_s_picks" type="int" default="0">
+				<description>Minimum number of S picks required per event</description>
+			</parameter>
+			<parameter name="pyocto.n_p_and_s_picks" type="int" default="3">
+				<description>Minimum number of stations contributing both a P and S pick</description>
+			</parameter>
+			<parameter name="pyocto.pick_match_tolerance" type="double" default="2.0">
+				<description>Maximum residual (s) for assigning a pick to an event in the refinement step</description>
+			</parameter>
+			<parameter name="pyocto.min_interevent_time" type="double" default="3.0">
+				<description>Minimum time (s) between two declared events</description>
+			</parameter>
+			<parameter name="pyocto.time_slicing" type="double" default="1200.0">
+				<description>PyOcto time slicing window (s)</description>
+			</parameter>
+
+			<!-- Module timing -->
+			<parameter name="pyocto.cycle_seconds" type="int" default="30">
+				<description>Run association every N seconds</description>
+			</parameter>
+			<parameter name="pyocto.max_pick_age" type="int" default="1800">
+				<description>Discard picks older than this many seconds from the sliding buffer</description>
+			</parameter>
+		</configuration>
+	</module>
+</seiscomp>

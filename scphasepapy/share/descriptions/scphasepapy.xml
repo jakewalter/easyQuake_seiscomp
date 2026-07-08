@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<seiscomp>
+	<module name="scphasepapy" category="Processing" inherit-global-bindings="false">
+		<description>
+			PhasePaPy associator for SeisComP. Receives picks from PICK group and
+			relates events with PhasePaPy's 1D associator.
+		</description>
+
+		<configuration>
+			<parameter name="phasepapy.db_dir" type="string" default="/tmp/scphasepapy"/>
+			<parameter name="phasepapy.db_assoc" type="string" default="assoc.db"/>
+			<parameter name="phasepapy.db_tt" type="string" default="tt.db"/>
+			<parameter name="phasepapy.max_km" type="double" default="350"/>
+			<parameter name="phasepapy.aggregation" type="double" default="1"/>
+			<parameter name="phasepapy.aggr_norm" type="string" default="L2"/>
+			<parameter name="phasepapy.assoc_ot_uncert" type="double" default="3"/>
+			<parameter name="phasepapy.nsta_declare" type="int" default="3"/>
+			<parameter name="phasepapy.cutoff_outlier" type="double" default="30"/>
+			<parameter name="phasepapy.loc_uncert_thresh" type="double" default="0.2"/>
+			<parameter name="phasepapy.cycle_seconds" type="int" default="30"/>
+			<parameter name="phasepapy.max_pick_age" type="int" default="3600"/>
+		</configuration>
+	</module>
+</seiscomp>
