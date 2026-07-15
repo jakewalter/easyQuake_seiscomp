@@ -581,6 +581,103 @@ def check_scautoloc_config():
     return problems, infos
 
 
+def check_scolv_region_filter(buffer_deg=0.2):
+    """Verify scolv's event-list region filter matches the current station footprint.
+
+    Computes a bounding box from share/scautoloc/station-locations.conf (the
+    outermost stations) padded by *buffer_deg* on each side, then compares it
+    to the `eventlist.filter.regions.region.<profile>.rect` configured in
+    etc/scolv.cfg. This filter only hides rows in the scolv event list (it
+    does not affect scevent/scautoloc processing) but goes stale whenever
+    stations are added or removed, e.g. via bbox_station_service.py.
+
+    Returns (problems, infos).
+    """
+    problems = []
+    infos = []
+
+    sta_loc_path = os.path.join(SEISCOMP_ROOT, 'share', 'scautoloc', 'station-locations.conf')
+    if not os.path.exists(sta_loc_path):
+        problems.append('station-locations.conf not found; cannot compute region filter bbox')
+        return problems, infos
+
+    lats, lons = [], []
+    with open(sta_loc_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            try:
+                lats.append(float(parts[2]))
+                lons.append(float(parts[3]))
+            except ValueError:
+                continue
+    if not lats:
+        problems.append('station-locations.conf has no parseable station coordinates')
+        return problems, infos
+
+    latmin = min(lats) - buffer_deg
+    latmax = max(lats) + buffer_deg
+    lonmin = min(lons) - buffer_deg
+    lonmax = max(lons) + buffer_deg
+    infos.append(
+        f'computed bbox from {len(lats)} stations + {buffer_deg} deg buffer: '
+        f'rect = {latmin:.4f}, {lonmin:.4f}, {latmax:.4f}, {lonmax:.4f}'
+    )
+
+    cfg = _parse_cfg(os.path.join(SEISCOMP_ROOT, 'etc', 'scolv.cfg'))
+    profiles = cfg.get('eventlist.filter.regions.profiles', '')
+    suggested = (
+        'eventlist.filter.regions.profiles = StationFootprint\n'
+        f'    eventlist.filter.regions.region.StationFootprint.name = Station Footprint +{buffer_deg}deg\n'
+        '    eventlist.filter.regions.region.StationFootprint.rect = '
+        f'{latmin:.4f}, {lonmin:.4f}, {latmax:.4f}, {lonmax:.4f}'
+    )
+    if not profiles:
+        problems.append(
+            'eventlist.filter.regions.profiles not set in etc/scolv.cfg - the event '
+            'list has no region-of-interest filter, so events far from the network '
+            '(teleseisms, etc.) will clutter the default view.  Add to etc/scolv.cfg:\n'
+            f'    {suggested}'
+        )
+        return problems, infos
+
+    first_profile = profiles.split(',')[0].strip()
+    rect_key = f'eventlist.filter.regions.region.{first_profile}.rect'
+    rect_val = cfg.get(rect_key, '')
+    if not rect_val:
+        problems.append(
+            f'{rect_key} not set even though profile "{first_profile}" is listed in '
+            f'eventlist.filter.regions.profiles.  Add:\n    {suggested}'
+        )
+        return problems, infos
+
+    try:
+        cur_latmin, cur_lonmin, cur_latmax, cur_lonmax = (
+            float(x.strip()) for x in rect_val.split(','))
+    except ValueError:
+        problems.append(f'{rect_key} = {rect_val!r} could not be parsed as 4 comma-separated numbers')
+        return problems, infos
+
+    tol = 0.01
+    if (abs(cur_latmin - latmin) > tol or abs(cur_lonmin - lonmin) > tol or
+            abs(cur_latmax - latmax) > tol or abs(cur_lonmax - lonmax) > tol):
+        problems.append(
+            f'{rect_key} = {cur_latmin:.4f}, {cur_lonmin:.4f}, {cur_latmax:.4f}, {cur_lonmax:.4f} '
+            f'is stale vs the current station footprint + {buffer_deg} deg buffer '
+            f'({latmin:.4f}, {lonmin:.4f}, {latmax:.4f}, {lonmax:.4f}).  Stations were likely '
+            'added/removed since this was set (e.g. via bbox_station_service.py).  Update '
+            f'etc/scolv.cfg with:\n    {rect_key} = {latmin:.4f}, {lonmin:.4f}, {latmax:.4f}, {lonmax:.4f}'
+        )
+    else:
+        infos.append(f'{rect_key} matches current station footprint + {buffer_deg} deg buffer')
+
+    return problems, infos
+
+
 def check_event_pipeline(running_modules):
     """Verify the full pick → origin → event → magnitude pipeline is running.
 
@@ -1544,6 +1641,17 @@ def run_check():
         print('  Then restart: seiscomp restart scautoloc')
     else:
         print('  scautoloc configuration looks correct.')
+    print()
+
+    print('--- scolv event list region filter ---')
+    region_issues, region_infos = check_scolv_region_filter()
+    for info in region_infos:
+        print('  INFO:', info)
+    if region_issues:
+        for p in region_issues:
+            print('  ISSUE:', p)
+    else:
+        print('  scolv region-of-interest filter is up to date.')
     print()
 
     print('Recommendations:')
