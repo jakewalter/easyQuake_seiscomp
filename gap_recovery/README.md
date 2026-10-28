@@ -74,7 +74,7 @@ python gap_recovery/gap_recovery.py --hours 72 --device cpu --pick-rate 0
 | `--sc-host` | `localhost` | SeisComP messaging host |
 | `--pick-spool` | `~/sceasyquake/picks` | YAML fallback dir if SC messaging unreachable |
 | `--pick-rate` | `20.0` | Max picks/s published to SeisComP messaging (0 = unlimited) |
-| `--earthscope-url` | `IRIS` | EarthScope FDSN URL or alias |
+| `--earthscope-url` | `https://service.earthscope.org` | EarthScope FDSN URL or alias |
 | `--no-earthscope` | — | Skip EarthScope FDSN fallback |
 | `--dry-run` | — | Scan and report only; no fetch, no picks |
 | `--scan-only` | — | Print gaps and exit |
@@ -82,6 +82,42 @@ python gap_recovery/gap_recovery.py --hours 72 --device cpu --pick-rate 0
 | `--no-pick` | — | Skip ML picking |
 | `--replay-spool` | — | Publish any YAML pick files from `--pick-spool` and exit |
 | `-v` / `--verbose` | — | DEBUG logging |
+
+### Targeted event recovery
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--event-time` | — | ISO8601 origin time of a known event. When given, skips the archive-wide and origin-gap scans entirely and runs the targeted mode below instead. |
+| `--event-lat` / `--event-lon` | — | Event location (degrees); required with `--event-time` |
+| `--event-id` | — | Optional label used in logs and as pick provenance |
+| `--event-radius-km` | `60` | Only consider stations within this distance of the event |
+| `--event-window-before` | `20` | Seconds before `--event-time` to start the re-fetch/re-pick window |
+| `--event-window-after` | `90` | Seconds after `--event-time` to end the window (covers P+S+coda out to `--event-radius-km`) |
+| `--recovery-threshold` | `0.3` | Picker probability threshold for this pass only (live `sceasyquake.cfg` is untouched) |
+
+Instead of scanning the whole archive, this mode finds the subscribed stations
+within `--event-radius-km` of a known event (via the live SeisComP inventory,
+not a static file), fetches/verifies just that tight time window, and re-picks
+it with a lower, more sensitive threshold than the live picker uses. Picks are
+published to the same PICK messaging group with `source=gap_recovery_targeted`
+(distinct pick provenance -- `Pick/gap_recovery_targeted/...`), so they're
+associated by the live scautoloc/scpyocto exactly like real-time picks.
+
+```bash
+# Try to recover a specific USGS-reported event our network didn't detect
+python gap_recovery/gap_recovery.py \
+    --event-time 2026-08-05T05:26:37.261 \
+    --event-lat 32.101 --event-lon -101.943 \
+    --event-id tx2026pgxqad \
+    --device cpu
+```
+
+This is safe to run more aggressively than the live picker because the target
+window is already known to contain a real, independently-confirmed event
+(e.g. from USGS/ComCat) -- a lower threshold there doesn't raise the
+network-wide false-pick rate the way permanently lowering `picker.threshold`
+would. `quakeportal/sync/usgs_sync.py` drives this automatically; see its
+docstring and the "USGS-only event recovery" section there.
 
 ## How it works
 
@@ -148,3 +184,27 @@ pip install obspy seisbench torch
 ```
 
 The `sceasyquake` library is loaded automatically from `../sceasyquake/lib`.
+
+## EarthScope authentication
+
+EarthScope limits anonymous FDSN data downloads to 10 GiB/hour and 50 GiB/day
+per IP, and **ends anonymous data access on 2026-12-15**
+(<https://docs.earthscope.org/user-limits>).  With an account token the quota
+is 200 GiB/hour and 1 TiB/day.
+
+Log in once per host with the EarthScope CLI, installed outside the
+SeisComP/anaconda environment (the SDK needs pydantic 2 and httpx):
+
+```bash
+pipx install earthscope-cli      # or: python3 -m venv ~/es-cli && ~/es-cli/bin/pip install earthscope-cli
+es login                         # device flow; prints a URL to open in a browser
+```
+
+This writes `~/.earthscope/default/tokens.json`.  `gap_recovery.py` reads it,
+refreshes the access token itself when it is near expiry, writes the refreshed
+tokens back, and sends `Authorization: Bearer ...` on every dataselect request.
+On a headless host, set `ES_OAUTH2__REFRESH_TOKEN` (from `es user get-refresh-token`)
+instead.  The log states at the EarthScope step whether the run is authenticated.
+
+HTTP 429 responses are waited out rather than dropped: 60 s, then until the
+next hour boundary, then until 00:00 UTC (EarthScope's fixed quota windows).

@@ -63,10 +63,26 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+# A handful of stations (observed 2026-08-08: the 4O.WB0x/WB1x series) have
+# miniSEED day-files that fail Steim1's internal data-integrity check on
+# nearly every record. The data still reads fine (obspy returns it either
+# way) -- this is a warning, not an error -- but Python's warnings.warn()
+# machinery is slow enough that a file emitting hundreds of these turns a
+# routine archive scan into a multi-hour stall: a --scan-only run over just
+# 48h never finished in over 15 minutes, and the full pipeline never got
+# past the scan step in 2+ hours. Silencing this specific category (not
+# warnings in general) turns that back into a normal-speed scan.
+try:
+    from obspy.io.mseed.headers import InternalMSEEDWarning
+    warnings.filterwarnings("ignore", category=InternalMSEEDWarning)
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------------------
 # Bootstrap sys.path so sceasyquake is importable without installation
@@ -163,8 +179,14 @@ def scan_origin_gaps(
     If there are *no* origins at all in the window the entire window is returned
     as a single gap.
 
-    SeisComP stores origin times as ``time_value`` (DOUBLE, Unix epoch seconds)
-    in the ``Origin`` table.
+    SeisComP stores origin times as ``time_value`` -- a MySQL ``DATETIME``
+    (naive, UTC) in this deployment's schema, NOT a numeric epoch. An earlier
+    version of this function compared time_value directly against Python
+    float epoch timestamps; MySQL does not coerce a DATETIME/float comparison
+    the way you'd hope, so every call silently matched zero rows regardless
+    of what was actually in the table (confirmed 2026-08-06: origins existed
+    seconds before the call, but the query still returned "0 origin(s)").
+    Always bind naive UTC datetime strings instead.
     """
     # Try available MySQL drivers in order of preference
     _mysql_mod = None
@@ -183,8 +205,11 @@ def scan_origin_gaps(
     now_dt   = datetime.now(timezone.utc)
     start_dt = datetime.fromtimestamp(now_dt.timestamp() - lookback_seconds,
                                       tz=timezone.utc)
-    now_epoch   = now_dt.timestamp()
-    start_epoch = start_dt.timestamp()
+
+    # time_value is a naive UTC DATETIME column -- bind naive UTC strings,
+    # not epoch floats (see docstring).
+    now_naive   = now_dt.replace(tzinfo=None)
+    start_naive = start_dt.replace(tzinfo=None)
 
     QUERY = """
         SELECT time_value
@@ -206,7 +231,7 @@ def scan_origin_gaps(
         )
         cursor = conn.cursor()
         try:
-            cursor.execute(QUERY, (start_epoch, now_epoch))
+            cursor.execute(QUERY, (start_naive, now_naive))
             rows = cursor.fetchall()
         finally:
             cursor.close()
@@ -225,27 +250,30 @@ def scan_origin_gaps(
         gaps.append(OriginGap(start_dt, now_dt, lookback_seconds))
         return gaps
 
-    # Helper: epoch float -> UTC datetime
-    def _dt(epoch_f: float) -> datetime:
-        return datetime.fromtimestamp(float(epoch_f), tz=timezone.utc)
+    # Helper: naive UTC datetime (as returned by the DB driver) -> tz-aware UTC
+    def _dt(value) -> datetime:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=timezone.utc)
+        # Some drivers may return a string; parse defensively.
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
-    times = [float(r[0]) for r in rows]
+    times = [_dt(r[0]) for r in rows]
 
     # Leading silence (window start -> first origin)
-    if times[0] - start_epoch > min_gap_s:
-        gaps.append(OriginGap(start_dt, _dt(times[0]),
-                               times[0] - start_epoch))
+    if (times[0] - start_dt).total_seconds() > min_gap_s:
+        gaps.append(OriginGap(start_dt, times[0],
+                               (times[0] - start_dt).total_seconds()))
 
     # Inter-origin silences
     for t_prev, t_next in zip(times, times[1:]):
-        dur = t_next - t_prev
+        dur = (t_next - t_prev).total_seconds()
         if dur > min_gap_s:
-            gaps.append(OriginGap(_dt(t_prev), _dt(t_next), dur))
+            gaps.append(OriginGap(t_prev, t_next, dur))
 
     # Trailing silence (last origin -> now)
-    if now_epoch - times[-1] > min_gap_s:
-        gaps.append(OriginGap(_dt(times[-1]), now_dt,
-                               now_epoch - times[-1]))
+    trailing = (now_dt - times[-1]).total_seconds()
+    if trailing > min_gap_s:
+        gaps.append(OriginGap(times[-1], now_dt, trailing))
 
     return gaps
 
@@ -280,17 +308,153 @@ def discover_channels(archive_dir: Path) -> List[Tuple[str, str, str, str]]:
     return sorted(channels)
 
 
+def _log_scan_progress(done: int, total: int, n_gaps: int, started: float):
+    """Emit a one-line progress update for the archive scan.
+
+    scan_gaps() reads and decodes every byte the window covers -- ~65 GB for
+    --hours 120, well over an hour of wall clock.  Without this it logs nothing
+    between "Scanning N channels" and "Gap scan complete", which is
+    indistinguishable from a hang (asked about in exactly those terms
+    2026-09-17).
+    """
+    elapsed = time.monotonic() - started
+    rate = done / elapsed if elapsed > 0 else 0.0
+    eta = "~%.0f min remaining" % ((total - done) / rate / 60.0) if rate > 0 else "ETA unknown"
+    log.info("  scan progress: %d/%d channels (%.0f%%) -- %d gap(s) so far, "
+             "%.1f min elapsed, %s",
+             done, total, 100.0 * done / total, n_gaps, elapsed / 60.0, eta)
+
+
+def _merge_per_sampling_rate(st, nslc: str, exc: Exception):
+    """Merge a Stream whose traces share an ID but disagree on sampling rate.
+
+    obspy refuses to merge the *whole* Stream if any two traces with the same
+    id differ in sampling rate, which happens whenever a datalogger is
+    reconfigured mid-window.  Since scan_gaps() runs one channel per loop
+    iteration, letting that propagate aborts the scan of every remaining
+    channel -- observed 2026-06-19 and again 2026-09-17, both times filling
+    zero gaps.  Coverage and gap spans are well defined per rate, so merge each
+    rate group on its own and recombine.
+    """
+    from obspy import Stream
+
+    rates = sorted({tr.stats.sampling_rate for tr in st})
+    log.warning("%s: traces at %d sampling rates (%s) -- merging per rate (%s)",
+                nslc, len(rates),
+                ", ".join("%g Hz" % r for r in rates), exc)
+    merged = Stream()
+    for rate in rates:
+        sub = Stream([tr for tr in st if tr.stats.sampling_rate == rate])
+        try:
+            sub.merge(method=1, fill_value=None)
+        except Exception as sub_exc:          # dtype clash etc. -- still not fatal
+            log.warning("%s @ %g Hz: merge still failed (%s) -- keeping traces unmerged",
+                        nslc, rate, sub_exc)
+        merged += sub
+    return merged
+
+
+def _channel_intervals_from_headers(
+    archive_dir: Path,
+    net: str, sta: str, loc: str, cha: str,
+    start, end,
+    margin_days: int = 2,
+) -> List[Tuple]:
+    """Return (starttime, endtime) spans for one channel, from record headers only.
+
+    Gap detection only needs to know *when* samples exist, which lives in the
+    miniSEED record headers -- decoding the Steim-compressed payload is pure
+    waste.  Reading headers only is ~3x faster (measured 2026-09-17 over a
+    frozen 24 h window: 10.45 s -> 3.37 s for 30 channels, identical gaps on
+    all 30).
+
+    Note this deliberately does NOT hand starttime/endtime to obspy.  With
+    ``headonly=True`` obspy *discards* any trace that would need trimming to
+    fit the window instead of adjusting its start time, so a day-file whose
+    data begins before the window simply disappears -- which fabricated a
+    10.4 h phantom gap on every channel tested.  Read each day-file whole and
+    clip the spans here instead.
+
+    ``margin_days`` covers data spilling past its nominal day-file: DOY 256 was
+    observed holding samples through Sep 14, two days past its own date.
+    """
+    from obspy import UTCDateTime, read
+
+    intervals: List[Tuple] = []
+    day  = UTCDateTime(start.year, start.month, start.day) - margin_days * 86400
+    last = UTCDateTime(end.year,   end.month,   end.day)   + margin_days * 86400
+
+    while day <= last:
+        path = (archive_dir / str(day.year) / net / sta / ("%s.D" % cha) /
+                ("%s.%s.%s.%s.D.%d.%03d"
+                 % (net, sta, loc, cha, day.year, day.julday)))
+        day += 86400
+        if not path.is_file():
+            continue
+        try:
+            st = read(str(path), headonly=True)
+        except Exception as exc:
+            log.debug("header read failed for %s: %s", path, exc)
+            continue
+        for tr in st:
+            if (tr.stats.network, tr.stats.station,
+                    tr.stats.location, tr.stats.channel) != (net, sta, loc, cha):
+                continue
+            s_clip = max(tr.stats.starttime, start)
+            e_clip = min(tr.stats.endtime, end)
+            if e_clip > s_clip:
+                intervals.append((s_clip, e_clip))
+    return intervals
+
+
+def _gaps_from_intervals(
+    intervals: List[Tuple],
+    net: str, sta: str, loc: str, cha: str,
+    start, end,
+    min_gap_s: float,
+) -> List[Gap]:
+    """Turn covered spans into Gap records, matching the full-read path exactly.
+
+    Edge gaps use ``>`` and interior gaps ``>=`` against min_gap_s, mirroring
+    the Stream.get_gaps() path so the two scan modes agree.
+    """
+    if not intervals:
+        return [Gap(net, sta, loc, cha, start, end, float(end - start), "missing_file")]
+
+    spans = sorted(intervals)
+    gaps: List[Gap] = []
+
+    earliest = spans[0][0]
+    latest   = max(e for _, e in spans)
+    if earliest > start + min_gap_s:
+        gaps.append(Gap(net, sta, loc, cha, start, earliest,
+                        float(earliest - start), "missing_file"))
+    if latest < end - min_gap_s:
+        gaps.append(Gap(net, sta, loc, cha, latest, end,
+                        float(end - latest), "missing_file"))
+
+    covered_to = spans[0][1]
+    for s_i, e_i in spans[1:]:
+        if float(s_i - covered_to) >= min_gap_s:
+            gaps.append(Gap(net, sta, loc, cha, covered_to, s_i,
+                            float(s_i - covered_to), "intra_file"))
+        if e_i > covered_to:
+            covered_to = e_i
+    return gaps
+
+
 def scan_gaps(
     archive_dir: Path,
     lookback_seconds: float,
     min_gap_s: float = 1.0,
+    use_headers: bool = True,
 ) -> List[Gap]:
     """Return every gap in the SDS archive over the last ``lookback_seconds``.
 
-    For each NSLC channel we request the full window from obspy's SDSClient.
-    If the returned Stream covers less than the requested window we report the
-    uncovered spans as gaps.  We also call ``Stream.get_gaps()`` for intra-file
-    dropouts.
+    With ``use_headers`` (the default) coverage is derived from miniSEED record
+    headers, which is ~3x faster than decoding every sample and yields the same
+    gaps.  Pass ``use_headers=False`` (CLI: ``--full-read-scan``) to fall back
+    to reading full waveforms through obspy's SDSClient.
     """
     try:
         from obspy import UTCDateTime
@@ -302,14 +466,32 @@ def scan_gaps(
     now   = UTCDateTime()
     start = now - lookback_seconds
 
-    sds = SDSClient(str(archive_dir))
+    sds = None if use_headers else SDSClient(str(archive_dir))
     channels = discover_channels(archive_dir)
-    log.info("Scanning %d channels over the last %.0f hours ?",
-             len(channels), lookback_seconds / 3600)
+    log.info("Scanning %d channels over the last %.0f hours (%s)",
+             len(channels), lookback_seconds / 3600,
+             "miniSEED headers" if use_headers else "full waveform read")
 
     gaps: List[Gap] = []
+    total = len(channels)
+    # ~20 updates across the run, but never noisier than every 25 channels
+    progress_every = max(25, total // 20)
+    scan_started = time.monotonic()
 
-    for net, sta, loc, cha in channels:
+    for idx, (net, sta, loc, cha) in enumerate(channels):
+        # Emitted at the TOP of the iteration: the "entire window missing"
+        # branches below end the iteration early, and on a degraded archive
+        # that is the common case -- a bottom-of-loop update would rarely fire.
+        if idx and idx % progress_every == 0:
+            _log_scan_progress(idx, total, len(gaps), scan_started)
+
+        if use_headers:
+            intervals = _channel_intervals_from_headers(
+                archive_dir, net, sta, loc, cha, start, now)
+            gaps.extend(_gaps_from_intervals(
+                intervals, net, sta, loc, cha, start, now, min_gap_s))
+            continue
+
         try:
             st = sds.get_waveforms(net, sta, loc, cha, start, now)
         except Exception as exc:
@@ -322,7 +504,12 @@ def scan_gaps(
                             lookback_seconds, "missing_file"))
             continue
 
-        st.merge(method=1, fill_value=None)
+        try:
+            st.merge(method=1, fill_value=None)
+        except Exception as exc:
+            # One reconfigured channel must not abort the scan of the rest.
+            st = _merge_per_sampling_rate(
+                st, "%s.%s.%s.%s" % (net, sta, loc, cha), exc)
 
         # Check coverage at the window edges
         earliest_data = min(tr.stats.starttime for tr in st)
@@ -349,7 +536,8 @@ def scan_gaps(
                 gaps.append(Gap(net, sta, loc, cha, gs, ge,
                                 float(ge - gs), "intra_file"))
 
-    log.info("Gap scan complete -- %d gap(s) found", len(gaps))
+    log.info("Gap scan complete -- %d gap(s) found in %.1f min",
+             len(gaps), (time.monotonic() - scan_started) / 60.0)
     return gaps
 
 
@@ -545,6 +733,158 @@ def _write_to_sds(
 _FDSN_BATCH_SIZE = 50
 
 
+_FDSN_INTER_BATCH_SLEEP_S  = 5.0
+_FDSN_RATE_LIMIT_MAX_TRIES = 6
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    if getattr(exc, "status_code", None) == 429:
+        return True
+    msg = str(exc).lower()
+    return "429" in msg or "rate limit" in msg or "too many requests" in msg
+
+
+def _rate_limit_wait_s(attempt: int, now: Optional[datetime] = None) -> float:
+    """Seconds to wait after the *attempt*-th consecutive HTTP 429.
+
+    EarthScope (https://docs.earthscope.org/user-limits) answers 429 for two
+    reasons: the request rate (3000/min, Retry-After 60) or the data quota
+    (anonymous: 10 GiB/hour, 50 GiB/day per IP, fixed windows resetting at
+    the top of the hour and at 00:00 UTC).  obspy 1.4 drops the Retry-After
+    header and the body, so escalate through those windows instead: 60 s,
+    then the next hour boundary, then the next UTC midnight.
+    """
+    now = now or datetime.now(timezone.utc)
+    if attempt == 0:
+        return 60.0
+    secs_into_hour = now.minute * 60 + now.second
+    if attempt == 1:
+        return 3600 - secs_into_hour + 30.0
+    secs_into_day = now.hour * 3600 + secs_into_hour
+    return 86400 - secs_into_day + 30.0
+
+
+# EarthScope account auth.  Anonymous dataselect is capped at 10 GiB/hour and
+# 50 GiB/day per IP and ends entirely on 2026-12-15; an account token raises
+# that to 200 GiB/hour.  Tokens come from `es login` (earthscope-cli, kept out
+# of this Python env -- the SDK needs pydantic 2/httpx), which writes
+# ~/.earthscope/<profile>/tokens.json; we refresh with the same public OAuth
+# client the SDK uses and write the result back in the same format.
+_ES_TOKENS_FILE   = Path.home() / ".earthscope" / "default" / "tokens.json"
+_ES_TOKEN_URL     = "https://login.earthscope.org/oauth/token"
+_ES_CLIENT_ID     = "b9DtAFBd6QvMg761vI3YhYquNZbJX5G0"
+_ES_REFRESH_SLACK = 300.0
+_es_tokens: dict  = {}
+
+
+def _jwt_exp(token: str) -> float:
+    import base64
+    import json
+    try:
+        payload = token.split(".", 2)[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except Exception:
+        return 0.0
+
+
+def _earthscope_access_token(tokens_file: Path = None) -> Optional[str]:
+    """Return a valid EarthScope access token, refreshing it if needed.
+
+    None means no credentials are configured (anonymous access).
+    """
+    import json
+    import urllib.parse
+    import urllib.request
+
+    tokens_file = tokens_file or _ES_TOKENS_FILE
+    if not _es_tokens:
+        try:
+            _es_tokens.update(json.loads(tokens_file.read_text()))
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log.warning("Could not read EarthScope tokens %s: %s", tokens_file, exc)
+        env_rt = os.environ.get("ES_OAUTH2__REFRESH_TOKEN")
+        if env_rt and not _es_tokens.get("refresh_token"):
+            _es_tokens["refresh_token"] = env_rt
+
+    at = _es_tokens.get("access_token")
+    if at and _jwt_exp(at) - time.time() > _ES_REFRESH_SLACK:
+        return at
+    rt = _es_tokens.get("refresh_token")
+    if not rt:
+        return None
+
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token", "client_id": _ES_CLIENT_ID,
+        "refresh_token": rt, "scopes": "offline_access",
+    }).encode()
+    req = urllib.request.Request(
+        _ES_TOKEN_URL, data=body,
+        headers={"content-type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            new = json.loads(resp.read())
+    except Exception as exc:
+        log.warning("EarthScope token refresh failed (%s) -- falling back to "
+                    "anonymous access; run `es login` to re-authenticate", exc)
+        return None
+
+    new.setdefault("refresh_token", rt)  # non-rotating refresh tokens are omitted
+    for k in ("access_token", "id_token", "refresh_token"):
+        if new.get(k):
+            _es_tokens[k] = new[k]
+    try:
+        tokens_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = tokens_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(
+            {k: _es_tokens[k] for k in ("access_token", "id_token", "refresh_token")
+             if _es_tokens.get(k)}, indent=2))
+        tmp.chmod(0o600)
+        tmp.replace(tokens_file)
+    except Exception as exc:
+        log.warning("Could not save refreshed EarthScope tokens: %s", exc)
+    log.info("EarthScope access token refreshed (expires %s)",
+             datetime.fromtimestamp(_jwt_exp(_es_tokens["access_token"]),
+                                    timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    return _es_tokens["access_token"]
+
+
+def _apply_earthscope_auth(client) -> bool:
+    """Set (or clear) the bearer header on an obspy FDSN client."""
+    headers = getattr(client, "request_headers", None)
+    if headers is None:
+        return False
+    token = _earthscope_access_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        return True
+    headers.pop("Authorization", None)
+    return False
+
+
+def _get_waveforms_bulk_with_backoff(client, bulk, n_gaps: int):
+    """get_waveforms_bulk, waiting out EarthScope HTTP 429 blocks.
+
+    The 2026-10-28 30-day backfill hit the anonymous 10 GiB/hour quota after
+    six batches; without a retry every remaining batch (7-117, 5458 gaps)
+    failed within seconds.
+    """
+    for attempt in range(_FDSN_RATE_LIMIT_MAX_TRIES):
+        _apply_earthscope_auth(client)  # quota waits can outlive a token
+        try:
+            return client.get_waveforms_bulk(bulk, quality="B")
+        except Exception as exc:
+            if not _is_rate_limited(exc) or attempt == _FDSN_RATE_LIMIT_MAX_TRIES - 1:
+                raise
+            delay = _rate_limit_wait_s(min(attempt, 2))
+            log.warning("EarthScope HTTP 429 on %d gap(s) (attempt %d) -- "
+                        "waiting %.0f s for the rate/quota window to reset",
+                        n_gaps, attempt + 1, delay)
+            time.sleep(delay)
+
+
 def _fetch_earthscope_batch(
     gaps: List[Gap],
     client,                       # obspy FDSNClient (already constructed)
@@ -561,9 +901,17 @@ def _fetch_earthscope_batch(
     """Send ONE bulk FDSN request for *gaps* and write the result to SDS.
 
     Splits recursively on HTTP-413 or TCP connection-reset errors so that
-    a single oversized batch never silently discards all gaps.
+    a single oversized batch never silently discards all gaps.  Also splits
+    on miniSEED decode errors: IRIS occasionally serves a corrupt record for
+    one station (4O.WB06, SC.WBN01, TX.PB25 on 2026-10-03), which makes obspy
+    reject the whole response and used to fail all ~50 gaps in the batch.
     """
     from urllib.error import URLError
+    try:
+        from obspy.io.mseed import ObsPyMSEEDError
+    except ImportError:
+        class ObsPyMSEEDError(Exception):
+            pass
 
     if not gaps:
         return []
@@ -586,19 +934,24 @@ def _fetch_earthscope_batch(
     ]
 
     try:
-        st = client.get_waveforms_bulk(bulk, quality="B")
+        st = _get_waveforms_bulk_with_backoff(client, bulk, len(gaps))
     except FDSNNoDataException:
         log.debug("EarthScope batch: no data for %d gap(s)", len(gaps))
         # Don't increment gaps_unresolved here -- caller handles accounting
         return gaps
-    except (FDSNRequestTooLargeException, URLError) as exc:
+    except (FDSNRequestTooLargeException, URLError, ObsPyMSEEDError) as exc:
         if len(gaps) == 1:
             # Cannot split further -- log and give up on this single gap
             log.warning("EarthScope: cannot fetch single gap %s -- %s", gaps[0], exc)
             stats.errors.append(f"EarthScope single-gap fetch failed: {gaps[0].nslc}: {exc}")
             return gaps
         # Split in half and retry each half independently
-        reason = "HTTP 413" if isinstance(exc, FDSNRequestTooLargeException) else f"connection error ({exc})"
+        if isinstance(exc, FDSNRequestTooLargeException):
+            reason = "HTTP 413"
+        elif isinstance(exc, ObsPyMSEEDError):
+            reason = "corrupt miniSEED: " + str(exc).splitlines()[0]
+        else:
+            reason = f"connection error ({exc})"
         log.warning(
             "EarthScope batch of %d gap(s) failed (%s) -- retrying in two halves",
             len(gaps), reason,
@@ -721,6 +1074,13 @@ def fetch_from_earthscope(
         stats.errors.append(f"EarthScope client error: {exc}")
         return gaps
 
+    if _apply_earthscope_auth(client):
+        log.info("EarthScope: authenticated with account token (%s)", _ES_TOKENS_FILE)
+    else:
+        log.warning("EarthScope: no account token -- anonymous quota is 10 GiB/h, "
+                    "50 GiB/day, and anonymous data access ends 2026-12-15. "
+                    "Run `es login` (earthscope-cli) to authenticate.")
+
     # Split into fixed-size batches before any request is made.
     # This prevents the connection reset that occurs when sending all 1000+
     # gaps in a single HTTP POST to service.iris.edu.
@@ -730,6 +1090,8 @@ def fetch_from_earthscope(
 
     all_unresolved: List[Gap] = []
     for batch_num, batch in enumerate(batches, 1):
+        if batch_num > 1:
+            time.sleep(_FDSN_INTER_BATCH_SLEEP_S)
         log.info("EarthScope: batch %d/%d  (%d gap(s)) ?",
                  batch_num, len(batches), len(batch))
         unresolved = _fetch_earthscope_batch(
@@ -809,6 +1171,51 @@ def _read_sceasyquake_cfg(
     }
 
 
+def _load_model_with_retry(predictor, label: str, attempts: int = 3,
+                           base_delay: float = 5.0) -> bool:
+    """Load a predictor's model, retrying transient failures. True if loaded.
+
+    This used to be `try: predictor.load_model() except Exception: pass`,
+    followed by an unconditional "Predictor loaded" log line. On 2026-09-17 that
+    turned a single transient CUDA failure (machine at load ~27, sceasyquake
+    holding the same GPU) into 1,600 picking windows that each logged "model not
+    loaded" and produced zero picks over 1h45m -- while the log claimed the
+    predictor had loaded successfully. The failure was genuinely transient:
+    re-running the identical factory call by hand afterwards loaded on CUDA
+    first try.
+
+    Loading a model costs seconds against a picking run measured in hours, so
+    retry it, and if it still will not load say so and let the caller abort
+    (both call sites already handle a None predictor) rather than picking
+    nothing for hours.
+    """
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            predictor.load_model()
+        except Exception as exc:
+            last_exc = exc
+            log.warning("%s: load_model() failed on attempt %d/%d: %s",
+                        label, attempt, attempts, exc)
+        else:
+            # load_model() returning falsy, or leaving no model behind, counts
+            # as failure too -- the SeisBench predictor warns per-window rather
+            # than raising once, which is what made this so quiet before.
+            if getattr(predictor, "_loaded_model", "unset") is None:
+                log.warning("%s: load_model() returned without loading a model "
+                            "(attempt %d/%d)", label, attempt, attempts)
+            else:
+                if attempt > 1:
+                    log.info("%s: model loaded on attempt %d", label, attempt)
+                return True
+        if attempt < attempts:
+            time.sleep(base_delay * attempt)
+
+    log.error("%s: model could not be loaded after %d attempts%s",
+              label, attempts, (" -- last error: %s" % last_exc) if last_exc else "")
+    return False
+
+
 def _build_predictor(cfg: dict):
     """Instantiate a predictor using sceasyquake-stream's own factory function.
 
@@ -836,10 +1243,9 @@ def _build_predictor(cfg: dict):
                 phases        = cfg.get("phases"),
                 label_order   = cfg.get("label_order"),
             )
-            try:
-                predictor.load_model()
-            except Exception:
-                pass
+            if not _load_model_with_retry(
+                    predictor, "sceasyquake-stream factory predictor"):
+                return None
             log.info("Predictor loaded via sceasyquake-stream factory: backend=%s device=%s",
                      cfg["backend"], cfg["device"])
             return predictor
@@ -852,10 +1258,8 @@ def _build_predictor(cfg: dict):
         from sceasyquake.predictors.phasenet import PhaseNetPredictor
         p = PhaseNetPredictor(backend=cfg["backend"], threshold=cfg["threshold"],
                               device=cfg["device"])
-        try:
-            p.load_model()
-        except Exception:
-            pass
+        if not _load_model_with_retry(p, "direct PhaseNetPredictor"):
+            return None
         return p
     except Exception as exc:
         log.error("Could not load predictor: %s", exc)
@@ -887,7 +1291,9 @@ if _HAS_SC_CLIENT:
                      sceasyquake_cfg_path: Optional[str], pick_spool: Path,
                      sc_host: str = "localhost",
                      device_override: Optional[str] = None,
-                     pick_rate: float = 20.0):
+                     pick_rate: float = 20.0,
+                     threshold_override: Optional[float] = None,
+                     pick_source: str = "gap_recovery"):
             # SC Application.__init__ takes argc/argv; pass a clean minimal argv
             # so it does not choke on gap_recovery's own argparse flags.
             # Use a PID-qualified name so concurrent or back-to-back runs don't
@@ -909,6 +1315,8 @@ if _HAS_SC_CLIENT:
             self._sc_host         = sc_host
             self._device_override = device_override
             self._pick_rate        = pick_rate
+            self._threshold_override = threshold_override
+            self._pick_source      = pick_source
 
         def run(self) -> bool:
             from sceasyquake.uploader import PickUploader
@@ -918,6 +1326,12 @@ if _HAS_SC_CLIENT:
                 log.info("Overriding picker device: %s -> %s",
                          cfg.get("device", "cpu"), self._device_override)
                 cfg["device"] = self._device_override
+            if self._threshold_override is not None:
+                log.info("Overriding picker threshold: %s -> %s (targeted recovery pass only; "
+                         "deployed sceasyquake.cfg is not modified)",
+                         cfg.get("threshold"), self._threshold_override)
+                cfg["threshold"] = self._threshold_override
+                cfg["gpd_threshold"] = self._threshold_override
             predictor = _build_predictor(cfg)
             # Use the system agencyID (read from global.cfg via SeisComP bindings)
             # so picks look the same as live sceasyquake picks to scautoloc.
@@ -928,7 +1342,7 @@ if _HAS_SC_CLIENT:
             uploader  = PickUploader(
                 connection = self.connection(),
                 out_dir    = str(self._pick_spool),
-                source     = "gap_recovery",
+                source     = self._pick_source,
                 agency_id  = _agency_id,
                 pick_rate  = self._pick_rate,
             )
@@ -1048,6 +1462,8 @@ def run_playback_picking(
     dry_run: bool = False,
     device_override: Optional[str] = None,
     pick_rate: float = 20.0,
+    threshold_override: Optional[float] = None,
+    pick_source: str = "gap_recovery",
 ):
     """Orchestrate the pick step.
 
@@ -1079,6 +1495,8 @@ def run_playback_picking(
                 sc_host               = sc_host,
                 device_override       = device_override,
                 pick_rate             = pick_rate,
+                threshold_override    = threshold_override,
+                pick_source           = pick_source,
             )
             app()
         except Exception as exc:
@@ -1093,6 +1511,11 @@ def run_playback_picking(
             log.info("Overriding picker device: %s -> %s",
                      cfg.get("device", "cpu"), device_override)
             cfg["device"] = device_override
+        if threshold_override is not None:
+            log.info("Overriding picker threshold: %s -> %s (targeted recovery pass only)",
+                     cfg.get("threshold"), threshold_override)
+            cfg["threshold"] = threshold_override
+            cfg["gpd_threshold"] = threshold_override
         predictor = _build_predictor(cfg)
         if predictor is None:
             log.error("Predictor unavailable -- aborting pick step")
@@ -1100,7 +1523,7 @@ def run_playback_picking(
         from sceasyquake.uploader import PickUploader
         pick_spool.mkdir(parents=True, exist_ok=True)
         uploader = PickUploader(connection=None, out_dir=str(pick_spool),
-                                source="gap_recovery", pick_rate=pick_rate)
+                                source=pick_source, pick_rate=pick_rate)
         _run_picking(gaps, archive_dir, predictor, uploader,
                      window_s, overlap_s, stats)
 
@@ -1128,12 +1551,32 @@ def _run_picking(
                  win_end.strftime("%Y-%m-%dT%H:%M:%S"),
                  float(win_end - win_start), len(involved_gaps))
 
-        nslc_set = {(g.network, g.station, g.location, g.channel)
-                    for g in involved_gaps}
+        # Overlapping gaps chain into one merged window (a 30-day backfill
+        # became a single 2026-09-28 -> 10-28 window), so picking every
+        # involved channel across the whole window re-picks data the live
+        # picker already covered.  Instead, read only channels whose own gap
+        # overlaps the chunk, and publish only picks inside that station's gaps.
+        involved_gaps = sorted(involved_gaps, key=lambda g: g.starttime.timestamp)
+        sta_gaps = {}
+        for g in involved_gaps:
+            sta_gaps.setdefault((g.network, g.station, g.location), []).append(
+                (g.starttime, g.endtime))
+
+        def _in_station_gap(net, sta, loc, pt):
+            return any(s <= pt <= e for s, e in sta_gaps.get((net, sta, loc), ()))
 
         t = win_start
         while t < win_end:
             chunk_end = min(t + window_s, win_end + overlap_s)
+            active = [g for g in involved_gaps
+                      if g.starttime < chunk_end and g.endtime > t]
+            if not active:
+                upcoming = [g.starttime for g in involved_gaps if g.starttime >= chunk_end]
+                if not upcoming:
+                    break
+                t = max(t + window_s - overlap_s, min(upcoming) - overlap_s)
+                continue
+            nslc_set = {(g.network, g.station, g.location, g.channel) for g in active}
             chunk_st  = Stream()
             for net, sta, loc, cha in nslc_set:
                 try:
@@ -1175,10 +1618,15 @@ def _run_picking(
                     pt = UTCDateTime(pick_time)
                     if pt < t or pt > chunk_end:
                         continue  # outside chunk window
+                    p_net = pick.network  if hasattr(pick, "network")  else pick.get("network", "")
+                    p_sta = pick.station  if hasattr(pick, "station")  else pick.get("station", "")
+                    p_loc = pick.location if hasattr(pick, "location") else pick.get("location", "")
+                    if not _in_station_gap(p_net, p_sta, p_loc, pt):
+                        continue  # live picker already covered this time
                     uploader.send_pick(
-                        network     = pick.network  if hasattr(pick, "network")  else pick.get("network", ""),
-                        station     = pick.station  if hasattr(pick, "station")  else pick.get("station", ""),
-                        location    = pick.location if hasattr(pick, "location") else pick.get("location", ""),
+                        network     = p_net,
+                        station     = p_sta,
+                        location    = p_loc,
                         channel     = pick.channel  if hasattr(pick, "channel")  else pick.get("channel", ""),
                         time        = pt,
                         phase       = pick.phase    if hasattr(pick, "phase")    else pick.get("phase", "P"),
@@ -1224,6 +1672,266 @@ def _merge_gap_windows(
 
     windows.append((cur_start, cur_end, cur_group))
     return windows
+
+
+# ---------------------------------------------------------------------------
+# TARGETED EVENT RECOVERY -- re-fetch/re-pick a tight window around one known
+# event (e.g. a USGS/ComCat event our own network missed) instead of scanning
+# the whole archive. Used by quakeportal/sync/usgs_sync.py to try to turn a
+# USGS-only catalog entry into a real, network-sourced detection before
+# falling back to a metadata-only stub.
+# ---------------------------------------------------------------------------
+
+def _load_subscribed_stations(cfg_path: Optional[str] = None) -> set:
+    """Return the set of (NET, STA) pairs sceasyquake actually subscribes to,
+    parsed from streams.codes in the deployed sceasyquake.cfg.
+
+    Only stations we actually ingest are worth re-fetching/re-picking -- any
+    others in the regional inventory aren't part of the live picker's input
+    and picks from them would look inconsistent with everything else in the
+    pipeline.
+    """
+    import re
+
+    candidates = []
+    if cfg_path:
+        candidates.append(Path(cfg_path).expanduser())
+    candidates += [
+        Path(os.path.expanduser("~/seiscomp/etc/sceasyquake.cfg")),
+        _HERE.parent / "sceasyquake" / "etc" / "sceasyquake.conf",
+    ]
+
+    for p in candidates:
+        if not p.exists():
+            continue
+        content = p.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"streams\.codes\s*=\s*(.*?)\n\s*\n", content, re.S)
+        if not m:
+            m = re.search(r"streams\.codes\s*=\s*(.*?)\n[a-zA-Z_]+\.[a-zA-Z_]+\s*=", content, re.S)
+        if not m:
+            continue
+        block = m.group(1)
+        codes = [c.strip().rstrip(",").strip("\\").strip()
+                 for c in block.replace("\\\n", " ").split(",")]
+        stas = set()
+        for c in codes:
+            if not c:
+                continue
+            parts = c.split(".")
+            if len(parts) >= 2:
+                stas.add((parts[0], parts[1]))
+        if stas:
+            return stas
+    return set()
+
+
+def _stations_within_radius(
+    lat: float,
+    lon: float,
+    radius_km: float,
+    mysql_host: str = "localhost",
+    mysql_port: int = 3306,
+    mysql_user: str = "sysop",
+    mysql_password: str = "sysop",
+    mysql_db: str = "seiscomp",
+) -> List[Tuple[str, str, float, float, float]]:
+    """Return (NET, STA, lat, lon, dist_km) for every currently-active station
+    in the SeisComP inventory (MySQL Network/Station tables -- the same live
+    inventory scpyocto loads) within radius_km of (lat, lon), sorted nearest
+    first.
+    """
+    import math
+
+    _mysql_mod = None
+    for _drv in ("mysql.connector", "pymysql", "MySQLdb"):
+        try:
+            import importlib as _importlib
+            _mysql_mod = _importlib.import_module(_drv)
+            break
+        except ImportError:
+            continue
+    if _mysql_mod is None:
+        log.warning("No MySQL driver found -- cannot look up station inventory. "
+                    "Install one with: pip install pymysql")
+        return []
+
+    def _haversine_km(lat1, lon1, lat2, lon2):
+        R = 6371.0
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (math.sin(dlat / 2) ** 2
+             + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+             * math.sin(dlon / 2) ** 2)
+        return R * 2 * math.asin(math.sqrt(a))
+
+    try:
+        _timeout_kwarg = ("connect_timeout"
+                          if _mysql_mod.__name__ in ("pymysql", "MySQLdb")
+                          else "connection_timeout")
+        conn = _mysql_mod.connect(
+            host=mysql_host, port=mysql_port,
+            user=mysql_user, password=mysql_password,
+            database=mysql_db, **{_timeout_kwarg: 10},
+        )
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT n.code, s.code, s.latitude, s.longitude
+                FROM Station s JOIN Network n ON n._oid = s._parent_oid
+                WHERE (s.end IS NULL OR s.end > NOW())
+                  AND s.latitude IS NOT NULL AND s.longitude IS NOT NULL
+            """)
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+    except Exception as exc:
+        log.warning("Could not query SeisComP inventory for nearby stations: %s", exc)
+        return []
+
+    nearby = []
+    for net, sta, slat, slon in rows:
+        d = _haversine_km(lat, lon, float(slat), float(slon))
+        if d <= radius_km:
+            nearby.append((net, sta, float(slat), float(slon), d))
+    nearby.sort(key=lambda t: t[4])
+    return nearby
+
+
+def run_targeted_recovery(
+    event_time: "UTCDateTime",
+    event_lat: float,
+    event_lon: float,
+    event_radius_km: float,
+    window_before_s: float,
+    window_after_s: float,
+    archive_dir: Path,
+    seedlink_host: str,
+    seedlink_port: int,
+    scart_bin: Path,
+    earthscope_url: str,
+    no_earthscope: bool,
+    no_fetch: bool,
+    sc_host: str,
+    sceasyquake_cfg_path: Optional[str],
+    pick_spool: Path,
+    device_override: Optional[str],
+    pick_rate: float,
+    recovery_threshold: float,
+    event_id: Optional[str],
+    mysql_host: str,
+    mysql_port: int,
+    mysql_user: str,
+    mysql_password: str,
+    mysql_db: str,
+    dry_run: bool,
+    stats: RecoveryStats,
+) -> bool:
+    """Re-fetch and re-pick a tight window around one known event using only
+    the stations near it, with a lower (more sensitive) picker threshold than
+    the live picker.threshold -- WITHOUT touching the deployed sceasyquake.cfg.
+
+    This is the "targeted" counterpart to the archive-wide scan/fetch/pick
+    pipeline above: instead of walking every channel over --hours, it builds
+    synthetic Gap entries for just the stations within event_radius_km of
+    (event_lat, event_lon) and reprocesses only the window around event_time.
+
+    Returns True if the recovery pass ran to completion (regardless of
+    whether it produced enough picks for scautoloc/scpyocto to actually form
+    a new origin -- that determination happens asynchronously in SeisComP and
+    is checked later by the caller). Returns False if no covering stations
+    were found at all, i.e. recovery could not even be attempted.
+    """
+    from obspy import UTCDateTime as _UTCDateTime  # noqa: F401 (type hint only)
+    from obspy.clients.filesystem.sds import Client as SDSClient
+
+    log.info("Targeted recovery: event %s @ (%.4f, %.4f) time=%s, radius=%.0fkm",
+             event_id or "?", event_lat, event_lon, event_time, event_radius_km)
+
+    near = _stations_within_radius(
+        event_lat, event_lon, event_radius_km,
+        mysql_host=mysql_host, mysql_port=mysql_port,
+        mysql_user=mysql_user, mysql_password=mysql_password, mysql_db=mysql_db,
+    )
+    subscribed = _load_subscribed_stations(sceasyquake_cfg_path)
+    covering = [(net, sta, slat, slon, d) for net, sta, slat, slon, d in near
+                if (net, sta) in subscribed]
+
+    if not covering:
+        log.warning("Targeted recovery: no subscribed station within %.0f km of "
+                    "(%.4f, %.4f) -- cannot attempt recovery for event %s",
+                    event_radius_km, event_lat, event_lon, event_id or "?")
+        return False
+
+    log.info("Targeted recovery: %d subscribed station(s) within %.0f km:",
+             len(covering), event_radius_km)
+    for net, sta, slat, slon, d in covering:
+        log.info("  %6.1f km  %s.%s", d, net, sta)
+
+    start = event_time - window_before_s
+    end   = event_time + window_after_s
+    gaps = [
+        Gap(net, sta, "*", "HH?", start, end, float(end - start), "targeted_event")
+        for net, sta, _, _, _ in covering
+    ]
+
+    sds = SDSClient(str(archive_dir))
+    missing = []
+    for g in gaps:
+        try:
+            st = sds.get_waveforms(g.network, g.station, g.location, g.channel,
+                                   g.starttime, g.endtime)
+        except Exception:
+            st = None
+        if not st or len(st) == 0:
+            missing.append(g)
+
+    log.info("Targeted recovery: %d/%d channel(s) missing data over the target window",
+             len(missing), len(gaps))
+
+    if missing and dry_run:
+        log.info("[DRY-RUN] would fetch %d missing channel(s)", len(missing))
+    elif missing and not no_fetch:
+        unresolved = fetch_from_seedlink(
+            missing, archive_dir, seedlink_host=seedlink_host, seedlink_port=seedlink_port,
+            scart_bin=scart_bin, stats=stats, dry_run=False,
+        )
+        if unresolved and not no_earthscope:
+            unresolved = fetch_from_earthscope(
+                unresolved, archive_dir, earthscope_url=earthscope_url,
+                scart_bin=scart_bin, stats=stats, dry_run=False,
+            )
+        if unresolved:
+            log.warning("Targeted recovery: %d channel(s) still missing after fetch attempts",
+                       len(unresolved))
+    elif missing:
+        log.info("[--no-fetch] Skipping fetch for %d missing channel(s)", len(missing))
+
+    if dry_run:
+        log.info("[DRY-RUN] would re-pick %d channel(s) around %s with threshold=%.2f",
+                 len(gaps), event_time, recovery_threshold)
+        return True
+
+    pick_spool.mkdir(parents=True, exist_ok=True)
+    cfg_path = sceasyquake_cfg_path if sceasyquake_cfg_path and Path(sceasyquake_cfg_path).exists() else None
+    run_playback_picking(
+        gaps                 = gaps,
+        archive_dir          = archive_dir,
+        window_s             = max(window_before_s + window_after_s, 60.0),
+        overlap_s            = 10.0,
+        stats                = stats,
+        sc_host              = sc_host,
+        sceasyquake_cfg_path = cfg_path,
+        pick_spool           = pick_spool,
+        dry_run              = False,
+        device_override      = device_override,
+        pick_rate            = pick_rate,
+        threshold_override   = recovery_threshold,
+        pick_source          = "gap_recovery_targeted",
+    )
+    log.info("Targeted recovery: pick pass complete for event %s -- %d pick(s) uploaded",
+             event_id or "?", stats.picks_uploaded)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1319,6 +2027,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Path to the SDS archive root (default: ~/seiscomp/var/lib/archive)")
     p.add_argument("--hours", type=float, default=24.0,
                    help="How many hours back to scan for gaps (default: 24)")
+    p.add_argument("--full-read-scan", action="store_true",
+                   help="Scan gaps by decoding full waveforms (legacy). The default "
+                        "derives coverage from miniSEED record headers, which is ~3x "
+                        "faster and yields identical gaps.")
     p.add_argument("--min-gap", type=float, default=1.0,
                    help="Minimum gap duration in seconds to report (default: 1.0)")
 
@@ -1347,11 +2059,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Path to the scart binary (default: ~/seiscomp/bin/scart)")
 
     # EarthScope FDSN fallback
-    p.add_argument("--earthscope-url", default="IRIS",
+    p.add_argument("--earthscope-url", default="https://service.earthscope.org",
                    help="FDSN datacenter ID or URL used as SeedLink fallback "
-                        "(default: IRIS  -- the EarthScope/IRIS DMC endpoint). "
-                        "Any obspy-recognised FDSN short-code or full URL is accepted, e.g. "
-                        "'IRIS', 'GEOFON', 'https://service.iris.edu'.")
+                        "(default: https://service.earthscope.org -- service.iris.edu "
+                        "now 301-redirects there).  The EarthScope account token from "
+                        "`es login` is sent as a bearer header when present.")
     p.add_argument("--no-earthscope", action="store_true",
                    help="Skip the EarthScope FDSN fallback even when SeedLink cannot fill a gap")
 
@@ -1412,6 +2124,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Enable DEBUG logging")
 
+    # Targeted event recovery -- alternative to the archive-wide scan above.
+    # See run_targeted_recovery(). Used by quakeportal/sync/usgs_sync.py to
+    # try to turn a USGS-only event into a real detection.
+    g = p.add_argument_group("Targeted event recovery")
+    g.add_argument("--event-time", default=None,
+                   help="ISO8601 origin time of a specific known event (e.g. from USGS/ComCat). "
+                        "When given, skips the archive-wide and origin-gap scans and instead "
+                        "re-fetches/re-picks only the stations near --event-lat/--event-lon over "
+                        "a tight window around this time.")
+    g.add_argument("--event-lat", type=float, default=None,
+                   help="Latitude of the target event (degrees); required with --event-time")
+    g.add_argument("--event-lon", type=float, default=None,
+                   help="Longitude of the target event (degrees); required with --event-time")
+    g.add_argument("--event-id", default=None,
+                   help="Optional label for the target event, used in logs and as pick provenance")
+    g.add_argument("--event-radius-km", type=float, default=60.0,
+                   help="Only consider stations within this distance of the target event (default: 60)")
+    g.add_argument("--event-window-before", type=float, default=20.0,
+                   help="Seconds before --event-time to start the re-fetch/re-pick window (default: 20)")
+    g.add_argument("--event-window-after", type=float, default=90.0,
+                   help="Seconds after --event-time to end the re-fetch/re-pick window (default: 90 -- "
+                        "covers P+S arrivals and coda out to --event-radius-km)")
+    g.add_argument("--recovery-threshold", type=float, default=0.3,
+                   help="Picker probability threshold used ONLY for this targeted recovery pass "
+                        "(default: 0.3, more sensitive than the live picker.threshold, typically "
+                        "0.5). Does not modify the deployed sceasyquake.cfg.")
+
     return p
 
 
@@ -1432,6 +2171,50 @@ def main():
             delete_after = True,
         )
         return
+
+    # ?? TARGETED EVENT RECOVERY (early exit) ????????????????????????????????
+    if args.event_time is not None:
+        if args.event_lat is None or args.event_lon is None:
+            log.error("--event-time requires --event-lat and --event-lon")
+            sys.exit(1)
+        archive_dir = Path(args.archive).expanduser()
+        if not archive_dir.is_dir():
+            log.error("Archive directory not found: %s", archive_dir)
+            sys.exit(1)
+        from obspy import UTCDateTime
+        stats = RecoveryStats()
+        log.info("=== TARGETED EVENT RECOVERY: %s ===", args.event_id or args.event_time)
+        ok = run_targeted_recovery(
+            event_time            = UTCDateTime(args.event_time),
+            event_lat              = args.event_lat,
+            event_lon              = args.event_lon,
+            event_radius_km         = args.event_radius_km,
+            window_before_s        = args.event_window_before,
+            window_after_s          = args.event_window_after,
+            archive_dir            = archive_dir,
+            seedlink_host           = args.seedlink_host,
+            seedlink_port           = args.seedlink_port,
+            scart_bin               = Path(args.scart).expanduser(),
+            earthscope_url          = args.earthscope_url,
+            no_earthscope           = args.no_earthscope,
+            no_fetch                = args.no_fetch,
+            sc_host                 = args.sc_host,
+            sceasyquake_cfg_path     = args.sceasyquake_cfg,
+            pick_spool               = Path(args.pick_spool).expanduser(),
+            device_override          = args.device,
+            pick_rate                = args.pick_rate,
+            recovery_threshold       = args.recovery_threshold,
+            event_id                 = args.event_id,
+            mysql_host               = args.sc_db_host,
+            mysql_port               = args.sc_db_port,
+            mysql_user               = args.sc_db_user,
+            mysql_password           = args.sc_db_pass,
+            mysql_db                 = args.sc_db_name,
+            dry_run                  = args.dry_run,
+            stats                    = stats,
+        )
+        _print_summary(stats)
+        sys.exit(0 if ok else 2)
 
     archive_dir = Path(args.archive).expanduser()
     if not archive_dir.is_dir():
@@ -1516,7 +2299,8 @@ def main():
         stats.gaps_found = 0
     else:
         log.info("\n=== STEP 1: Scanning archive %s (last %.0f h) ===", archive_dir, args.hours)
-        gaps = scan_gaps(archive_dir, args.hours * 3600, min_gap_s=args.min_gap)
+        gaps = scan_gaps(archive_dir, args.hours * 3600, min_gap_s=args.min_gap,
+                         use_headers=not args.full_read_scan)
         stats.gaps_found = len(gaps)
 
     if not gaps:
