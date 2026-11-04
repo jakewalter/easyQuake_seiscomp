@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1345,6 +1346,7 @@ if _HAS_SC_CLIENT:
                 source     = self._pick_source,
                 agency_id  = _agency_id,
                 pick_rate  = self._pick_rate,
+                reconnect  = True,
             )
 
             if predictor is None:
@@ -1365,7 +1367,10 @@ if _HAS_SC_CLIENT:
         """
 
         def __init__(self, spool_dir: Path, sc_host: str = "localhost",
-                     delete_after: bool = True):
+                     delete_after: bool = True, since: Optional[str] = None,
+                     author: Optional[str] = "gap_recovery",
+                     pick_start: Optional[str] = None, pick_end: Optional[str] = None,
+                     pick_rate: float = 20.0):
             _name = f"gap_replay_{os.getpid()}"
             _argv = [_name, "-H", sc_host, "--console=1"]
             _sc_client.Application.__init__(self, len(_argv), _argv)
@@ -1374,34 +1379,57 @@ if _HAS_SC_CLIENT:
             self.setPrimaryMessagingGroup("PICK")
             self._spool_dir    = spool_dir
             self._delete_after = delete_after
+            self._since        = since
+            self._author       = author
+            self._pick_start   = pick_start
+            self._pick_end     = pick_end
+            self._pick_rate    = pick_rate
             self._published    = 0
             self._failed       = 0
+            self._skipped      = 0
 
         def run(self) -> bool:
             import yaml as _yaml
             from obspy import UTCDateTime
             from sceasyquake.uploader import PickUploader
 
+            # Unthrottled replay of a big spool floods scmaster, and a failed
+            # send would immediately re-spool the pick under a new name
+            # (delete-and-rewrite churn), so throttle and reconnect like a run.
             uploader = PickUploader(
                 connection = self.connection(),
                 out_dir    = str(self._spool_dir),
                 source     = "gap_recovery",
+                pick_rate  = self._pick_rate,
+                reconnect  = True,
             )
 
+            since_ts = UTCDateTime(self._since).timestamp if self._since else None
+            t0 = UTCDateTime(self._pick_start) if self._pick_start else None
+            t1 = UTCDateTime(self._pick_end) if self._pick_end else None
+
             pick_files = sorted(self._spool_dir.glob("pick_*.yml"))
-            log.info("Replaying %d YAML pick file(s) from %s ?",
+            if since_ts is not None:
+                pick_files = [pf for pf in pick_files if pf.stat().st_mtime >= since_ts]
+            log.info("Replaying up to %d YAML pick file(s) from %s ?",
                      len(pick_files), self._spool_dir)
 
             for pf in pick_files:
                 try:
                     with open(pf) as fh:
                         data = _yaml.safe_load(fh)
+                    pt = UTCDateTime(data["time"])
+                    if ((self._author and data.get("author") != self._author)
+                            or (t0 is not None and pt < t0)
+                            or (t1 is not None and pt > t1)):
+                        self._skipped += 1
+                        continue
                     result = uploader.send_pick(
                         network     = data["network"],
                         station     = data["station"],
                         location    = data.get("location", ""),
                         channel     = data["channel"],
-                        time        = UTCDateTime(data["time"]),
+                        time        = pt,
                         phase       = data.get("phase", "P"),
                         probability = data.get("probability"),
                         method      = data.get("method", "PhaseNet"),
@@ -1412,19 +1440,76 @@ if _HAS_SC_CLIENT:
                         if self._delete_after:
                             pf.unlink()
                     else:
-                        # send_pick returned a path string (YAML fallback) -- still failed
+                        # send_pick returned a path string (YAML fallback) -- still
+                        # failed; the pick now lives in that new file, so drop the
+                        # old one rather than keep two copies.
                         self._failed += 1
+                        if self._delete_after:
+                            pf.unlink()
                         log.warning("Pick replay fell back to YAML again for %s", pf.name)
                 except Exception as exc:
                     self._failed += 1
                     log.warning("Failed to replay pick %s: %s", pf.name, exc)
 
-            log.info("Replay complete -- published %d, failed %d",
-                     self._published, self._failed)
+            log.info("Replay complete -- published %d, failed %d, skipped %d (filtered)",
+                     self._published, self._failed, self._skipped)
             return True
 
 
-def replay_yaml_spool(spool_dir: Path, sc_host: str, delete_after: bool = True):
+_GAP_LINE_RE = re.compile(
+    r"([A-Za-z0-9]+)\.([A-Za-z0-9]+)\.([A-Za-z0-9]*)\.([A-Za-z0-9]+)\s+"
+    r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d) -> (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\s+"
+    r"\((\d+)s\s+\[(\w+)\]\)\s*$")
+
+
+def _load_gaps_from_log(path: Path) -> List[Gap]:
+    """Rebuild a gap list from a run log's 'Waveform gaps detected:' block.
+
+    Only that block is read: the fetch step logs "[ok] ... filled" lines in the
+    same format, which would otherwise be double-counted.
+    """
+    from obspy import UTCDateTime
+
+    gaps: List[Gap] = []
+    in_block = False
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if not in_block:
+                in_block = "Waveform gaps detected:" in line
+                continue
+            m = _GAP_LINE_RE.search(line)
+            if not m:
+                break
+            net, sta, loc, cha, t0, t1, dur, src = m.groups()
+            gaps.append(Gap(net, sta, loc, cha, UTCDateTime(t0), UTCDateTime(t1),
+                            float(dur), src))
+    if not gaps:
+        raise ValueError(f"No 'Waveform gaps detected:' block found in {path}")
+    log.info("Loaded %d gap(s) from %s", len(gaps), path)
+    return gaps
+
+
+def _clip_gaps(gaps: List[Gap], start: Optional[str], end: Optional[str]) -> List[Gap]:
+    """Clip gaps to [start, end] (UTC strings, either may be None); drop empties."""
+    from obspy import UTCDateTime
+
+    t0 = UTCDateTime(start) if start else None
+    t1 = UTCDateTime(end) if end else None
+    out = []
+    for g in gaps:
+        s = max(g.starttime, t0) if t0 is not None else g.starttime
+        e = min(g.endtime, t1) if t1 is not None else g.endtime
+        if e > s:
+            out.append(Gap(g.network, g.station, g.location, g.channel,
+                           s, e, float(e - s), g.source))
+    return out
+
+
+def replay_yaml_spool(spool_dir: Path, sc_host: str, delete_after: bool = True,
+                      since: Optional[str] = None,
+                      author: Optional[str] = "gap_recovery",
+                      pick_start: Optional[str] = None, pick_end: Optional[str] = None,
+                      pick_rate: float = 20.0):
     """Publish all YAML pick files in ``spool_dir`` to SC messaging.
 
     Picks were written there as a fallback when the messaging connection was
@@ -1444,7 +1529,9 @@ def replay_yaml_spool(spool_dir: Path, sc_host: str, delete_after: bool = True):
 
     try:
         app = ReplaySpoolApp(spool_dir=spool_dir, sc_host=sc_host,
-                             delete_after=delete_after)
+                             delete_after=delete_after, since=since, author=author,
+                             pick_start=pick_start, pick_end=pick_end,
+                             pick_rate=pick_rate)
         app()
     except Exception as exc:
         log.error("ReplaySpoolApp failed: %s", exc)
@@ -2105,7 +2192,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip ML picking step")
     p.add_argument("--replay-spool", action="store_true",
                    help="Publish any YAML pick files from the spool directory to SC "
-                        "messaging and exit (use after a run that fell back to YAML)")
+                        "messaging and exit (use after a run that fell back to YAML). "
+                        "Filter with --replay-since, --replay-author, --pick-start/--pick-end.")
+    p.add_argument("--replay-since", default=None,
+                   help="--replay-spool: only files modified at/after this UTC time "
+                        "(e.g. 2026-10-29T05:43:00)")
+    p.add_argument("--replay-author", default="gap_recovery",
+                   help="--replay-spool: only picks with this author (default: gap_recovery; "
+                        "'' for any)")
+    p.add_argument("--gaps-from", default=None,
+                   help="Load the gap list from a previous run's log (its 'Waveform gaps "
+                        "detected:' block) instead of scanning.  Needed to re-pick after a "
+                        "fetch already filled the archive, since a rescan no longer sees "
+                        "those spans as gaps.  Usually combined with --no-fetch.")
+    p.add_argument("--pick-start", default=None,
+                   help="Clip gaps (and --replay-spool pick times) to start at this UTC time")
+    p.add_argument("--pick-end", default=None,
+                   help="Clip gaps (and --replay-spool pick times) to end at this UTC time")
     p.add_argument("--pick-rate", type=float, default=20.0,
                    help="Maximum picks/second to publish to the SeisComP messaging bus "
                         "(default: 20).  Throttling prevents flooding scmaster which can "
@@ -2169,6 +2272,11 @@ def main():
             spool_dir    = pick_spool,
             sc_host      = args.sc_host,
             delete_after = True,
+            since        = args.replay_since,
+            author       = args.replay_author or None,
+            pick_start   = args.pick_start,
+            pick_end     = args.pick_end,
+            pick_rate    = args.pick_rate,
         )
         return
 
@@ -2293,7 +2401,11 @@ def main():
         origin_gaps = []
 
     # ?? 1. SCAN ???????????????????????????????????????????????????????????
-    if args.no_scan:
+    if args.gaps_from:
+        log.info("\n=== STEP 1: Loading gap list from %s (no scan) ===", args.gaps_from)
+        gaps = _load_gaps_from_log(Path(args.gaps_from).expanduser())
+        stats.gaps_found = len(gaps)
+    elif args.no_scan:
         log.info("\n[--no-scan] Skipping archive waveform gap scan")
         gaps = []
         stats.gaps_found = 0
@@ -2301,6 +2413,12 @@ def main():
         log.info("\n=== STEP 1: Scanning archive %s (last %.0f h) ===", archive_dir, args.hours)
         gaps = scan_gaps(archive_dir, args.hours * 3600, min_gap_s=args.min_gap,
                          use_headers=not args.full_read_scan)
+        stats.gaps_found = len(gaps)
+    if args.pick_start or args.pick_end:
+        n_before = len(gaps)
+        gaps = _clip_gaps(gaps, args.pick_start, args.pick_end)
+        log.info("Clipped gaps to %s -> %s: %d of %d remain",
+                 args.pick_start or "-", args.pick_end or "-", len(gaps), n_before)
         stats.gaps_found = len(gaps)
 
     if not gaps:
