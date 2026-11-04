@@ -93,6 +93,47 @@ This is the tool responsible for everything `status_check.py apply` intentionall
 
 ---
 
+## Ingesting a directory-based miniSEED feed (EdgeQuake / `mseedscan`)
+
+Some data sources aren't SeedLink servers — they just drop continuously-growing miniSEED files onto disk. `~/EdgeQuake` (a separate project on this host) writes station `HOME1`'s three channels this way, into an SDS-like tree:
+
+```
+~/EdgeQuake/server_side/mseed_test/XX/HOME1/HNZ_00.D/HOME1.D.XX.HNZ.00.2026.247
+                                        HNN_00.D/...
+                                        HNE_00.D/...
+```
+
+SeisComP has a native SeedLink plugin for exactly this, **`mseedscan`** — no custom plugin needed. It recursively watches a directory tree, tails files as they're appended/rotated, and injects new records into SeedLink's ring buffer. It reads network/station/location/channel straight out of the miniSEED record headers, so the plugin doesn't care about file/directory naming — it only needs the directory to scan. One caveat: `mseedscan`'s record length is hardcoded to 512 bytes at compile time; EdgeQuake's output was confirmed to already be standard 512-byte records, so no conversion was needed.
+
+Bindings were added following the same `etc/key/` profile pattern the 4O-network chain stations already use:
+
+`~/seiscomp/etc/key/seedlink/profile_mseedscan_home1`:
+```
+sources = mseedscan
+sources.mseedscan.dir = /home/jwalter/EdgeQuake/server_side/mseed_test/XX/HOME1
+```
+
+`~/seiscomp/etc/key/station_XX_HOME1`:
+```
+global
+seedlink:mseedscan_home1
+```
+
+Applied with:
+```
+seiscomp update-config seedlink
+seiscomp restart seedlink
+```
+
+Verify with:
+```
+slinktool -Q localhost:18000 | grep HOME1
+```
+
+Note: station `XX.HOME1` was **not** added to inventory as part of this — SeedLink will buffer/serve the waveforms regardless, but `scautopick`/`scautoloc`/easyQuake won't use them until the station has an inventory entry (coordinates at minimum). Restarting `seedlink` briefly interrupts every other feed on the same daemon (including the live 4O-network chain from UT), since it's one shared process for all sources.
+
+---
+
 ## Standing up a new system in minutes
 
 The two tools are designed to compose: snapshot the config you already trust, let `bbox_station_service.py` provision the *new* region's stations, then apply the rest of the config template on top.
