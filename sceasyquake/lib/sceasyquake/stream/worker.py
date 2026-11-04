@@ -158,24 +158,28 @@ class StreamWorker:
                     candidates = candidates[:self.max_batch_stations]
 
                 keys_and_copies = []
-                # nsl_cutoffs: (net,sta,loc) -> float epoch of earliest acceptable pick.
-                # Only picks at or after (buf_end - step_seconds) are new this step;
-                # earlier picks were already published in a previous window pass.
-                nsl_cutoffs = {}
+                # step_cutoffs: (net,sta,loc) -> float epoch of earliest acceptable pick.
+                # Tracks the cutoffs for filtering picks processed in this step.
+                step_cutoffs = {}
+                nsl_buf_ends = {}
                 for _overdue, key, buf_copy in candidates:
                     self._last_pred[key] = now
-                    # Record the cutoff for this (net, sta, loc): picks must be
-                    # >= buf_end - step_seconds to be considered new.
                     try:
                         buf_end = max(float(tr.stats.endtime) for tr in buf_copy)
-                        cutoff = buf_end - self.step_seconds
                         parts = key.split('.', 2)
                         nsl = (parts[0], parts[1], parts[2] if len(parts) > 2 else '')
-                        # Use the most-recent cutoff seen for this station buffer
-                        if nsl not in nsl_cutoffs or cutoff > nsl_cutoffs[nsl]:
-                            nsl_cutoffs[nsl] = cutoff
-                    except Exception:
-                        pass
+                        
+                        # Retrieve the persistent cutoff, fallback to buf_end - self.step_seconds
+                        prev_cutoff = self._nsl_pick_cutoff.get(nsl)
+                        if prev_cutoff is None:
+                            cutoff = buf_end - self.step_seconds
+                        else:
+                            cutoff = prev_cutoff
+                        
+                        step_cutoffs[nsl] = cutoff
+                        nsl_buf_ends[nsl] = buf_end
+                    except Exception as e:
+                        log.warning('Error computing cutoff for %s: %s', key, e)
                     keys_and_copies.append((key, buf_copy))
 
             # Batch all ready station buffers into a single predict_multi() call so
@@ -198,14 +202,18 @@ class StreamWorker:
             log.info('Inference: %d station(s) -> %d raw pick(s) in %.1fs',
                      len(keys_and_copies), len(all_picks), elapsed)
 
+            # If prediction succeeded, commit the new cutoffs to self._nsl_pick_cutoff
+            for nsl, buf_end in nsl_buf_ends.items():
+                self._nsl_pick_cutoff[nsl] = buf_end
+
             # Filter out picks that fall in the already-published overlap region.
-            # Any pick whose time < (buf_end - step_seconds) was already reported
-            # in a previous window and must be suppressed.
+            # Any pick whose time < cutoff was already reported in a previous window
+            # and must be suppressed.
             new_picks = []
             for p in all_picks:
                 try:
                     nsl = (p.get('network', ''), p.get('station', ''), p.get('location', ''))
-                    cutoff = nsl_cutoffs.get(nsl)
+                    cutoff = step_cutoffs.get(nsl)
                     if cutoff is None or float(p['time']) >= cutoff:
                         new_picks.append(p)
                 except Exception:

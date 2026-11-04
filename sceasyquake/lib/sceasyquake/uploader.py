@@ -82,6 +82,8 @@ class PickUploader:
         source: str = 'sceasyquake',
         agency_id: str = None,
         pick_rate: float = 0.0,
+        reconnect: bool = False,
+        reconnect_interval_s: float = 10.0,
     ):
         """
         Parameters
@@ -92,6 +94,13 @@ class PickUploader:
             live sceasyquake process.  Gap-recovery runs should use a
             value such as 20.0 to avoid flooding scmaster and destabilising
             other connected clients (e.g. the live sceasyquake process).
+        reconnect:
+            On a failed send, call ``connection.reconnect()`` (at most once
+            per *reconnect_interval_s*) and retry.  Off by default: a regular
+            Application's own message loop handles reconnects, but
+            gap_recovery overrides ``run()`` so nothing else ever reconnects
+            (2026-10-29: scmaster segfaulted and was restarted by the watchdog
+            at 05:43; the backfill kept failing every send for 8 h after).
         """
         self._connection = connection
         self.out_dir = out_dir or _DEFAULT_OUT_DIR
@@ -100,8 +109,12 @@ class PickUploader:
         self._pick_rate = float(pick_rate)          # picks/s; 0 = unlimited
         self._min_interval = (1.0 / pick_rate) if pick_rate > 0 else 0.0
         self._last_send_ts: float = 0.0
+        self._reconnect = reconnect
+        self._reconnect_interval = float(reconnect_interval_s)
+        self._last_reconnect_ts: float = float('-inf')
         os.makedirs(self.out_dir, exist_ok=True)
         self._pick_counter = 0
+        self._yaml_counter = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -217,7 +230,20 @@ class PickUploader:
             log.warning('Notifier produced empty message for pick %s', public_id)
             return False
 
-        self._connection.send('PICK', msg)
+        # Connection.send() returns bool -- it does NOT raise on a dead/broken
+        # connection, it just returns False. The caller here used to ignore
+        # that return value entirely and log "Published" / return True
+        # regardless, so once scmaster died mid-run every subsequent pick was
+        # silently dropped for the rest of the process's life while this code
+        # kept reporting success (confirmed 2026-08-09: a gap_recovery run
+        # lost 95% of its picks this way after a single mid-run scmaster
+        # crash, discovered only by cross-checking "picks sent" in the log
+        # against actual rows in the DB). Raise so send_pick()'s existing
+        # try/except falls back to the YAML spool instead of lying about
+        # success.
+        if not self._send_msg('PICK', msg):
+            raise RuntimeError(f'connection.send() returned False for pick {public_id} '
+                                '(messaging connection likely down)')
         # Throttle to avoid flooding scmaster when publishing historical picks
         # from gap_recovery (which can emit thousands of picks in rapid succession).
         # The live sceasyquake process uses pick_rate=0 (no throttle) so real-time
@@ -279,19 +305,57 @@ class PickUploader:
 
             msg2 = sc_dm.Notifier.GetMessage(True)
             if msg2 is not None and msg2.size():
-                self._connection.send('AMPLITUDE', msg2)
-                log.debug('Published SNR amplitude %.2f for pick %s', snr_val, public_id)
+                # Best-effort by design (a missing amplitude just leaves that
+                # one pick stalled in scautoloc rather than failing the whole
+                # pick), but still worth a visible warning rather than
+                # silently swallowing it at debug level -- a dead connection
+                # here fails the same way as the PICK send above and used to
+                # go completely unnoticed.
+                if self._send_msg('AMPLITUDE', msg2):
+                    log.debug('Published SNR amplitude %.2f for pick %s', snr_val, public_id)
+                else:
+                    log.warning('SNR amplitude send returned False for pick %s '
+                                '(messaging connection likely down)', public_id)
         except Exception as exc:
             log.debug('SNR amplitude publish failed (non-fatal): %s', exc)
 
         return True
+
+    def _send_msg(self, group: str, msg) -> bool:
+        """``connection.send()``, plus one throttled reconnect-and-retry if enabled."""
+        if self._connection.send(group, msg):
+            return True
+        if not self._reconnect:
+            return False
+        now = _time.monotonic()
+        if now - self._last_reconnect_ts < self._reconnect_interval:
+            return False
+        self._last_reconnect_ts = now
+        log.warning('Send to %s failed; reconnecting to messaging', group)
+        try:
+            self._connection.reconnect()
+        except Exception as exc:
+            log.warning('Messaging reconnect failed: %s', exc)
+            return False
+        if not self._connection.isConnected():
+            log.warning('Messaging reconnect did not succeed; will retry in %.0f s',
+                        self._reconnect_interval)
+            return False
+        log.info('Reconnected to messaging')
+        return bool(self._connection.send(group, msg))
 
     # ------------------------------------------------------------------
     # YAML fallback path
     # ------------------------------------------------------------------
 
     def _write_yaml(self, data: dict) -> str:
-        fname = os.path.join(self.out_dir, f'pick_{int(_time.time() * 1000)}.yml')
+        # ms timestamp alone collides when picks fail faster than 1/ms (the
+        # throttle only runs after a successful send): 2026-10-29 a backfill
+        # wrote 84,830 fallbacks into 66,584 files, silently overwriting ~18k.
+        self._yaml_counter += 1
+        fname = os.path.join(
+            self.out_dir,
+            f'pick_{int(_time.time() * 1000)}_{os.getpid()}_{self._yaml_counter}.yml')
         with open(fname, 'w') as fh:
             yaml.safe_dump(data, fh)
         log.info('Wrote pick YAML fallback → %s', fname)
