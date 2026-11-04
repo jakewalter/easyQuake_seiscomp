@@ -1,0 +1,55 @@
+# Default NonLinLoc control file used by the locnll SeisComP plugin (via
+# screloc). LOCFILES/LOCSIG/LOCCOM are injected per-event by the plugin
+# itself; this file supplies the fixed search/grid/model parameters.
+#
+# TRANS must exactly match what was used to build the DB1D travel-time
+# grids (nonlinloc/run/vel2grid.in, grid2time.in) -- otherwise station and
+# event positions would be projected inconsistently.
+CONTROL 1 54321
+TRANS SIMPLE 31.5 -104.0 0.0
+
+LOCHYPOUT SAVE_NLLOC_ALL
+
+LOCSEARCH OCT 10 10 4 0.01 20000 5000 0 1
+
+# LOCGRID numx numy numz origx origy origz dx dy dz type save
+# Must cover the whole scpyocto association area (pyocto.lat_min/max=28/35,
+# pyocto.lon_min/max=-109/-99 in the live scpyocto.cfg) in the TRANS SIMPLE
+# projection above, plus margin -- that's +-389km north-south and +-474km
+# east-west from the (31.5,-104.0) origin. The previous +-150km box was far
+# too small: events located near/outside the network edges landed on the
+# grid boundary and got rejected outright ("max prob location on grid
+# boundary N, rejecting location") or came back as an empty location,
+# confirmed 2026-08-08 as the main reason the NonLinLoc relocation backlog
+# wasn't draining. Widening this does not require regenerating the
+# per-station travel-time tables (those are built radially per-station out
+# to 300km via vel2grid.in/grid2time*.in, independent of this box), and
+# NLLoc's OCT search cost is bounded by LOCSEARCH OCT's maxNumNodes/
+# maxNumScatter below, not by this box's nominal size.
+# Constrained 2026-08-19 to the network's actual association footprint.
+# Previously 1101x941x66 from (-550,-470,-5), which spans lat 27.27-35.73,
+# lon -109.80..-98.20 and depth -5..60 km -- materially LARGER than the region
+# pyocto can even associate in (lat 28-35, lon -109..-99, depth 0-50). An
+# unconverged inversion therefore ran to the grid walls and published a
+# physically impossible hypocenter. Measured that day: 457 NLL origins landed
+# outside the footprint, 42% of them sitting exactly on the old grid edge
+# (lat 35.700/27.300 etc), and 209 events (2.17% since Aug 12) carried one as
+# their PREFERRED origin. Ground-truth check against USGS on the 6 such events
+# that had a ComCat match: NLL median error 524 km versus pyocto's 9 km on the
+# same events -- i.e. relocation was destroying locations pyocto had right to
+# within 0.6-0.9 km. Separately, z starting at -5.0 let 36.9% of ALL NLL origins
+# be placed above sea level, which for ~1 km-elevation West Texas is impossible;
+# z now starts at 0.0, matching pyocto's depth_min. Clipping to the footprint
+# does not make an unconverged solution correct -- it will now pin at the
+# footprint edge instead -- but it bounds the error at ~80 km rather than ~520 km
+# and keeps every published hypocenter inside the region the network can sample.
+LOCGRID  949 779 51  -474.0 -389.0 0.0  1.0 1.0 1.0  PROB_DENSITY SAVE
+
+LOCMETH EDT_OT_WT 9999.0 4 -1 -1 -1 6 -1.0 1
+LOCGAU 0.2 0.0
+LOCGAU2 0.02 0.05 2.0
+LOCPHASEID  P   P p Pn Pg
+LOCPHASEID  S   S s Sn Sg
+LOCQUAL2ERR 0.1 0.5 1.0 2.0 99999.9
+LOCANGLES ANGLES_YES 5
+LOCPHSTAT 9999.0 -1 9999.0 1.0 1.0 9999.9 -9999.9 9999.9

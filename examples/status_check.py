@@ -39,6 +39,28 @@ working correctly:
 * **recent picks and SNR amplitudes** in the DB (last 10 min) with pairing
   ratio ≥ 90 % — confirms the pick-amplitude flow that scautoloc requires.
 
+* **screloc / NonLinLoc automatic relocation** (optional enhancement, not
+  part of the core pipeline): screloc is enabled but **must NOT run as a
+  persistent daemon** — it has no guard against reprocessing its own
+  NonLinLoc output, which caused a self-sustaining feedback loop (17,000+
+  spurious origins, system overload) on 2026-08-05. Relocation instead runs
+  via ``nonlinloc/relocate_new_origins.py`` on a cron timer, which only ever
+  feeds screloc's single-origin ``-O`` mode with origins from a *real*
+  associator (scpyocto/scautoloc) that don't already have an NLL-authored
+  sibling — the loop is impossible by construction. Checks: screloc NOT
+  running as a daemon; the cron job is present (``crontab -l``) and
+  ``nonlinloc/relocate.log`` is recently updated; ``plugins`` includes
+  ``locnll`` (the plugin's .so basename, not its registered name
+  "NonLinLoc"); ``reloc.locator`` / ``reloc.profile`` set;
+  ``reloc.allowAnyStatus = true`` (required here since scpyocto/scautoloc
+  origins have no evaluationStatus, which fails screloc's default
+  "must be PRELIMINARY" filter); ``NonLinLoc.controlFile`` exists; and each
+  configured profile's travel-time grids actually exist on disk. Those
+  grids are network/station-specific (built by Vel2Grid/Grid2Time from this
+  deployment's inventory + the DB1D velocity model) and are **not** copied
+  by ``apply`` — see its printed instructions for regenerating them on a
+  new system.
+
 The output is plain text with diagnostic suggestions when something looks
 wrong.  The intent is to run this periodically or manually when you suspect
 problems and get a quick checklist of things to fix.
@@ -577,6 +599,166 @@ def check_scautoloc_config():
             'buffer.pickKeep not set – using SeisComP default (typically 1800s = 30 min). '
             'For gap recovery replay, set buffer.pickKeep = 21600 (6 hours) or larger.'
         )
+
+    return problems, infos
+
+
+def check_screloc_config(running_modules):
+    """Audit the NonLinLoc relocation setup (screloc's config + locnll plugin +
+    the cron-based relocate_new_origins.py wrapper).
+
+    IMPORTANT: screloc must NOT run as a persistent, LOCATION-group-subscribed
+    daemon in this deployment. On 2026-08-05 running it that way caused a
+    self-sustaining feedback loop: screloc has no guard against reprocessing
+    its own output (methodID='NonLinLoc'), which is AUTOMATIC/no-
+    evaluationStatus just like everything else once reloc.allowAnyStatus=true
+    is set -- so its own relocated origin lands right back on the LOCATION
+    group it's subscribed to and gets relocated again, forever. This produced
+    17,000+ spurious origins and system overload within ~90 minutes before
+    being caught. `seiscomp disable screloc` is the correct, permanent state.
+
+    Instead, nonlinloc/relocate_new_origins.py runs periodically via cron
+    (see crontab -l): each invocation queries for origins from a REAL
+    associator (scpyocto, scautoloc) whose event has no NLL-authored sibling
+    yet, and feeds only those to `screloc -O <origin-id>` (single-origin,
+    non-subscribing mode), capped at --max-per-run. Since screloc's own
+    output is structurally excluded from ever being a candidate, the loop is
+    impossible by construction, not just by configuration.
+
+    Checks:
+    - screloc module is enabled but NOT running as a daemon (the opposite of
+      check_event_pipeline()'s usual "must be running" pattern)
+    - the relocate_new_origins.py cron job is present in `crontab -l`
+    - relocate.log shows recent activity (within the cron interval)
+    - `plugins` includes `locnll` (the actual .so basename SeisComP looks
+      for -- NOT the plugin's registered name "NonLinLoc", a common
+      first-try mistake)
+    - reloc.locator / reloc.profile are set
+    - reloc.allowAnyStatus = true -- scpyocto/scautoloc origins here have no
+      evaluationStatus (NULL), which is not PRELIMINARY, so without this
+      screloc silently ignores every origin it sees
+    - NonLinLoc.controlFile exists
+    - NonLinLoc.profiles is non-empty and each profile's tablePath actually
+      has generated travel-time grids on disk (Vel2Grid/Grid2Time output) --
+      these are network/station-specific and are NOT copied by
+      apply_snapshot(); they must be regenerated for a new deployment.
+
+    Returns (problems, infos).
+    """
+    problems = []
+    infos = []
+
+    if 'screloc' in running_modules:
+        problems.append(
+            'screloc is running as a persistent daemon -- this is UNSAFE: it has no '
+            'guard against reprocessing its own NonLinLoc output and will loop on '
+            'itself indefinitely (see 2026-08-05 incident: 17,000+ spurious origins, '
+            'system overload). Fix: seiscomp stop screloc && seiscomp disable screloc, '
+            'and rely on the cron-based nonlinloc/relocate_new_origins.py wrapper instead.'
+        )
+    else:
+        infos.append('screloc is not running as a daemon (correct -- see cron wrapper below)')
+
+    rc, cron_out = _run(['crontab', '-l'])
+    if rc != 0 or 'relocate_new_origins.py' not in cron_out:
+        problems.append(
+            'relocate_new_origins.py is not in crontab -- new origins will never be '
+            'relocated with NonLinLoc/DB1D. Add (see nonlinloc/relocate_new_origins.py '
+            'docstring for the exact line):\n'
+            '    */2 * * * * python3 .../nonlinloc/relocate_new_origins.py --max-per-run 20'
+        )
+    else:
+        infos.append('relocate_new_origins.py cron job present')
+        log_path = os.path.join(EASYQUAKE_ROOT, 'nonlinloc', 'relocate.log')
+        if os.path.exists(log_path):
+            age_min = (time.time() - os.path.getmtime(log_path)) / 60
+            if age_min > 15:
+                problems.append(
+                    f'nonlinloc/relocate.log last written {age_min:.0f} min ago -- the cron '
+                    f'job may not be firing (check `crontab -l`, cron daemon status, and the '
+                    f'log itself for errors)'
+                )
+            else:
+                infos.append(f'relocate.log last updated {age_min:.1f} min ago')
+        else:
+            infos.append('relocate.log does not exist yet (cron job may not have fired yet)')
+
+    cfg_path = os.path.join(SEISCOMP_ROOT, 'etc', 'screloc.cfg')
+    defaults_path = os.path.join(SEISCOMP_ROOT, 'etc', 'defaults', 'screloc.cfg')
+    cfg = {}
+    cfg.update(_parse_cfg(defaults_path))
+    cfg.update(_parse_cfg(cfg_path))
+
+    if not os.path.exists(cfg_path):
+        problems.append('etc/screloc.cfg does not exist -- no user config applied; '
+                        'screloc will start but relocate nothing')
+        return problems, infos
+
+    plugins = cfg.get('plugins', '')
+    if 'locnll' not in plugins:
+        problems.append(
+            f'plugins = {plugins!r} does not include "locnll" -- screloc will fail '
+            f'to start with "Did not find plugin NonLinLoc" (the plugins list wants '
+            f'the .so basename "locnll", not the plugin\'s registered name "NonLinLoc"). '
+            f'Add to etc/screloc.cfg: plugins = ${{plugins}}, locnll'
+        )
+    else:
+        infos.append(f'plugins: {plugins}')
+
+    locator = cfg.get('reloc.locator', '')
+    profile = cfg.get('reloc.profile', '')
+    if not locator:
+        problems.append('reloc.locator not set in screloc.cfg; add: reloc.locator = NonLinLoc')
+    else:
+        infos.append(f'reloc.locator: {locator}')
+    if not profile:
+        problems.append('reloc.profile not set in screloc.cfg; add: reloc.profile = <name>')
+    else:
+        infos.append(f'reloc.profile: {profile}')
+
+    allow_any = cfg.get('reloc.allowAnyStatus', 'false').strip().lower()
+    if allow_any not in ('true', '1'):
+        problems.append(
+            'reloc.allowAnyStatus is not true -- scpyocto/scautoloc origins in this '
+            'deployment have no evaluationStatus set (NULL), which fails screloc\'s '
+            'default "must be PRELIMINARY" check, so screloc will silently ignore '
+            'every origin it sees.  Add: reloc.allowAnyStatus = true'
+        )
+    else:
+        infos.append('reloc.allowAnyStatus: true')
+
+    control_file = cfg.get('NonLinLoc.controlFile', '')
+    if not control_file:
+        problems.append('NonLinLoc.controlFile not set in screloc.cfg')
+    elif not os.path.exists(os.path.expanduser(control_file)):
+        problems.append(f'NonLinLoc.controlFile not found: {control_file}')
+    else:
+        infos.append(f'NonLinLoc.controlFile: {control_file}')
+
+    profiles = [p.strip() for p in cfg.get('NonLinLoc.profiles', '').split(',') if p.strip()]
+    if not profiles:
+        problems.append('NonLinLoc.profiles is empty -- no regional profile configured')
+    for prof in profiles:
+        table_path = cfg.get(f'NonLinLoc.profile.{prof}.tablePath', '')
+        if not table_path:
+            problems.append(f'NonLinLoc.profile.{prof}.tablePath not set')
+            continue
+        table_path = os.path.expanduser(table_path)
+        grid_glob = f'{table_path}.P.*.time.buf'
+        matches = glob.glob(grid_glob)
+        if not matches:
+            problems.append(
+                f'No travel-time grid files found for profile "{prof}" matching '
+                f'{grid_glob} -- Vel2Grid/Grid2Time have not been run for this '
+                f'deployment\'s stations/velocity model, or tablePath is wrong. '
+                f'These are network-specific and are NOT copied by `apply` -- '
+                f'regenerate with Vel2Grid + Grid2Time for the new station set '
+                f'(see nonlinloc/run/*.in for the DB1D control-file templates).'
+            )
+        else:
+            n_stations = len(matches)
+            infos.append(f'profile "{prof}": {n_stations} station P-grid(s) found '
+                        f'at {table_path}.P.*')
 
     return problems, infos
 
@@ -1453,12 +1635,23 @@ def apply_snapshot(snapshot_dir, seiscomp_root=SEISCOMP_ROOT, execute=False):
     print()
     print('Next steps:')
     print('  1. Fix the flagged files above (real DB password in scmaster.cfg, any')
-    print('     machine-specific absolute paths such as scfakequake model/repo paths).')
+    print('     machine-specific absolute paths such as scfakequake model/repo paths')
+    print('     and screloc.cfg\'s NonLinLoc.controlFile/outputPath/tablePath).')
     print("  2. Run bbox_station_service.py against the new deployment's bounding box to")
     print('     populate etc/key/station_*, etc/key/seedlink/profile_*, etc/inventory/,')
     print('     and share/scautoloc/station-locations.conf for the new stations.')
+    print('  2b. If screloc.cfg was copied (automatic NonLinLoc relocation): regenerate')
+    print('      its travel-time grids for the new station set -- these are excluded from')
+    print('      git/apply just like station bindings. From nonlinloc/run/:')
+    print('        Vel2Grid vel2grid.in                    # only needed once per velocity model')
+    print('        # regenerate stations.gtsrce from the new deployment\'s Station/Network')
+    print('        # inventory (see nonlinloc/republish_scpyocto.py\'s station query for the')
+    print('        # GTSRCE format), then:')
+    print('        Grid2Time grid2time.in                  # P')
+    print('        Grid2Time grid2time_S.in                # S')
     print('  3. seiscomp update-config && seiscomp restart')
-    print('  4. python examples/status_check.py check   # verify the new system is healthy')
+    print('  4. python examples/status_check.py check   # verify the new system is healthy,')
+    print('     including the screloc / NonLinLoc relocation section')
     return {'copy': copy, 'exclude': exclude, 'review': review, 'backup': backup_dir}
 
 
@@ -1641,6 +1834,18 @@ def run_check():
         print('  Then restart: seiscomp restart scautoloc')
     else:
         print('  scautoloc configuration looks correct.')
+    print()
+
+    print('--- screloc / NonLinLoc automatic relocation ---')
+    screloc_issues, screloc_infos = check_screloc_config(running)
+    for info in screloc_infos:
+        print('  INFO:', info)
+    if screloc_issues:
+        for p in screloc_issues:
+            print('  ISSUE:', p)
+    else:
+        print('  NonLinLoc/DB1D relocation configured correctly (screloc daemon disabled, '
+              'cron wrapper active).')
     print()
 
     print('--- scolv event list region filter ---')

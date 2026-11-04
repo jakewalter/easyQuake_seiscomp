@@ -8,6 +8,7 @@
 !/scphasepapy/
 !/scpyocto/
 !/gap_recovery/
+!/nonlinloc/
 !/archive_cleanup.sh
 !/associator_status.sh
 
@@ -39,8 +40,26 @@ scpyocto/.pytest_cache/
 scpyocto/**/.pytest_cache/
 
 # gap_recovery: track the source, never the runtime logs (multi-GB)
-gap_recovery/__pycache__/
+gap_recovery/**/__pycache__/
 gap_recovery/logs/
+
+# nonlinloc: track the control files and code (vel2grid.in, grid2time*.in,
+# screloc_nll.in, republish_scpyocto.py) -- these encode the DB1D velocity
+# model and grid geometry and are reusable on any deployment covering the
+# same region. Never track the generated station coordinates or the
+# Vel2Grid/Grid2Time binary grid outputs: those are specific to this
+# network's exact station list and must be regenerated for a new
+# deployment (see status_check.py's screloc/NonLinLoc check), same as
+# bbox_station_service.py regenerates station-locations.conf.
+nonlinloc/run/stations.gtsrce
+nonlinloc/model/
+nonlinloc/time/
+nonlinloc/loc/
+nonlinloc/obs/
+nonlinloc/*_backup_*/
+nonlinloc/__pycache__/
+nonlinloc/*.log
+nonlinloc/relocate_failures.json
 
 # generated snapshot/comparison output from examples/status_check.py
 /seiscomp_snapshots/

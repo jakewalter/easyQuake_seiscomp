@@ -1,0 +1,9 @@
+CONTROL 1 54321
+TRANS SIMPLE 31.5 -104.0 0.0
+
+GTFILES  ./model/db1d  ./time/db1d  S
+GTMODE GRID2D ANGLES_YES
+
+INCLUDE ./run/stations.gtsrce
+
+GT_PLFD  1.0e-3  0

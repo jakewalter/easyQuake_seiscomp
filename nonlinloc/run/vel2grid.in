@@ -1,0 +1,41 @@
+# =============================================================================
+# Vel2Grid control file -- DB1D (Permian/Delaware Basin 1D velocity model)
+#
+# DB1D layer values digitized from Figure 2 of Lomax & Savvaidis (2019),
+# "Improving Absolute Earthquake Location in West Texas Using Probabilistic,
+# Proxy Ground-Truth Station Corrections", JGR Solid Earth.
+# Precision: read off a published plot, not the exact source table (Huang
+# et al. 2017 / Savvaidis et al. 2019) -- see conversation notes. Good enough
+# to replace scpyocto's coarse 0D vp/vs model; refine later if the exact
+# published table becomes available.
+#
+# Depth convention: z=0 at mean sea level, negative z = above sea level
+# (station elevations in this network reach ~1000 m).
+# =============================================================================
+
+CONTROL 1 54321
+TRANS SIMPLE 31.5 -104.0 0.0
+
+VGOUT ./model/db1d
+VGTYPE P
+VGTYPE S
+
+# 2D (radially-symmetric) grid: distance 0-600km, depth -5 to 60km, 1km spacing.
+# xNum=2 is the NonLinLoc convention for a trivial x-dimension in a 2D/SLOW_LEN
+# model (travel times depend only on distance+depth, not azimuth).
+# Widened from 300km 2026-08-08: scpyocto's association box (lat 28-35 /
+# lon -109/-99) is up to ~475km/~389km from the network center, so stations
+# 300-400+km from an edge-of-domain event had no travel time at all and got
+# silently dropped -- confirmed as the reason NonLinLoc relocation was
+# failing ("Empty location") for most of the backlog. This grid is per-
+# station and radial (distance x depth), so cost scales linearly with the
+# distance range, not quadratically -- doubling it roughly doubles size and
+# Grid2Time compute, not more.
+VGGRID 2 601 66 0.0 0.0 -5.0 1.0 1.0 1.0 SLOW_LEN
+
+# LAYER depthTop Vp VpGrad Vs VsGrad rho rhoGrad
+# Density is not used by the travel-time-only workflow (Grid2Time/NLLoc P&S
+# arrival location); placeholder value/gradient only.
+LAYER    -5.0     5.90    0.0     3.00    0.0     2.70    0.0
+LAYER    10.0     6.45    0.0     3.55    0.0     2.85    0.0
+LAYER    32.5     7.95    0.0     4.55    0.0     3.30    0.0
