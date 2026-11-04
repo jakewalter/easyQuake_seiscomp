@@ -44,6 +44,25 @@ class SCPyOctoApp(sc_client.Application):
         # Defaults
         self._cycle_seconds = 30
         self._max_pick_age = 1800
+        # gap_recovery's targeted USGS-event recovery (see quakeportal/sync/
+        # usgs_sync.py) republishes picks whose own waveform time is already
+        # stale by the time they reach scmaster: 25-40+ minutes for a
+        # freshly-noticed event (USGS feed lag + usgs_sync's own poll cycle +
+        # gap_recovery's model-load/pick/publish time), but up to
+        # MISSED_LOOKBACK_DAYS=7 days for a backlog candidate that only just
+        # lost its 2-attempt/2h-backoff eligibility check -- confirmed
+        # 2026-08-11 with a real attempt (tx2026pnskjm) publishing 49 picks
+        # ~3 days stale. An initial fix using a 6h budget missed that
+        # backlog case entirely (measured: those 49 picks got zero
+        # Arrivals, pruned same as before). Rather than raise max_pick_age
+        # globally (which would make every real-time cycle buffer and
+        # octree-associate proportionally more picks -- a real CPU cost on
+        # this chronically loaded host, see reference_system_load_fragility
+        # memory), picks identified as coming from that pathway (publicID
+        # prefix 'Pick/gap_recovery_targeted/') get a separate age budget
+        # sized to the recovery system's own 7-day design window instead
+        # (with a day of margin for scheduling slop).
+        self._targeted_recovery_max_age = 8 * 86400
 
         # Bounding box
         self._lat_min = 28.0
@@ -67,6 +86,18 @@ class SCPyOctoApp(sc_client.Application):
         self._pick_match_tolerance = 2.0
         self._min_interevent_time = 3.0
         self._time_slicing = 1200.0
+
+        # Octree discretization ("gridding") for the association/localization
+        # search. PyOcto's stock defaults (10.0 / 1.5 / 6 / 4 / 3) were tuned
+        # for smaller regional test areas; over a domain spanning several
+        # hundred km they leave a coarse residual grid in the search space
+        # that shows up as lat/lon-aligned linear artifacts in epicenter maps.
+        # Tightened here; still fully overridable via scpyocto.cfg.
+        self._min_node_size = 10.0
+        self._min_node_size_location = 0.5
+        self._location_split_depth = 8
+        self._location_split_return = 4
+        self._refinement_iterations = 4
 
         self._assoc = None
         self._stations_df = None
@@ -98,6 +129,13 @@ class SCPyOctoApp(sc_client.Application):
         self.commandline().addDoubleOption('scPyOcto', 'time-slicing', 'PyOcto time slicing parameter (s)')
         self.commandline().addDoubleOption('scPyOcto', 'cycle-seconds', 'Run association every N seconds')
         self.commandline().addDoubleOption('scPyOcto', 'max-pick-age', 'Maximum pick age to retain (s)')
+        self.commandline().addDoubleOption('scPyOcto', 'targeted-recovery-max-age',
+                                            'Maximum pick age (s) for gap_recovery_targeted-sourced picks')
+        self.commandline().addDoubleOption('scPyOcto', 'min-node-size', 'Octree node size (km) that triggers event creation')
+        self.commandline().addDoubleOption('scPyOcto', 'min-node-size-location', 'Octree location-search precision floor (km)')
+        self.commandline().addDoubleOption('scPyOcto', 'location-split-depth', 'Octree search depth for location splits')
+        self.commandline().addDoubleOption('scPyOcto', 'location-split-return', 'Octree location-split levels used for even sampling only')
+        self.commandline().addDoubleOption('scPyOcto', 'refinement-iterations', 'Localisation/pick-matching refinement iterations')
         return True
 
     def _cfg(self, key, default=''):
@@ -153,6 +191,15 @@ class SCPyOctoApp(sc_client.Application):
         self._time_slicing = self._cfg_float('pyocto.time_slicing', 'time-slicing', self._time_slicing)
         self._cycle_seconds = self._cfg_int('pyocto.cycle_seconds', 'cycle-seconds', self._cycle_seconds)
         self._max_pick_age = self._cfg_int('pyocto.max_pick_age', 'max-pick-age', self._max_pick_age)
+        self._targeted_recovery_max_age = self._cfg_int(
+            'pyocto.targeted_recovery_max_age', 'targeted-recovery-max-age',
+            self._targeted_recovery_max_age)
+
+        self._min_node_size = self._cfg_float('pyocto.min_node_size', 'min-node-size', self._min_node_size)
+        self._min_node_size_location = self._cfg_float('pyocto.min_node_size_location', 'min-node-size-location', self._min_node_size_location)
+        self._location_split_depth = self._cfg_int('pyocto.location_split_depth', 'location-split-depth', self._location_split_depth)
+        self._location_split_return = self._cfg_int('pyocto.location_split_return', 'location-split-return', self._location_split_return)
+        self._refinement_iterations = self._cfg_int('pyocto.refinement_iterations', 'refinement-iterations', self._refinement_iterations)
 
         self._stations_df = self._load_stations()
         if self._stations_df is None or len(self._stations_df) == 0:
@@ -180,6 +227,11 @@ class SCPyOctoApp(sc_client.Application):
             pick_match_tolerance=self._pick_match_tolerance,
             min_interevent_time=self._min_interevent_time,
             time_slicing=self._time_slicing,
+            min_node_size=self._min_node_size,
+            min_node_size_location=self._min_node_size_location,
+            location_split_depth=self._location_split_depth,
+            location_split_return=self._location_split_return,
+            refinement_iterations=self._refinement_iterations,
         )
 
         # Project station coordinates into the associator's local CRS
@@ -195,6 +247,13 @@ class SCPyOctoApp(sc_client.Application):
             (self._vp, self._vs, self._tolerance, self._n_picks,
              self._n_p_picks, self._n_s_picks, self._n_p_and_s_picks,
              self._pick_match_tolerance, self._cycle_seconds)
+        )
+        sc_log.info(
+            'scPyOcto: gridding min_node_size=%.2fkm min_node_size_location=%.2fkm '
+            'split_depth=%d split_return=%d refinement_iterations=%d' %
+            (self._min_node_size, self._min_node_size_location,
+             self._location_split_depth, self._location_split_return,
+             self._refinement_iterations)
         )
 
         self.enableTimer(self._cycle_seconds)
@@ -293,6 +352,7 @@ class SCPyOctoApp(sc_client.Application):
                 'time': pick_time_unix,
                 'station': station_id,
                 'phase': phase,
+                'targeted_recovery': pick.publicID().startswith('Pick/gap_recovery_targeted/'),
             }
             sc_log.debug('scPyOcto: buffered %s %s %s' % (pick.publicID(), station_id, phase))
         except Exception as e:
@@ -311,7 +371,11 @@ class SCPyOctoApp(sc_client.Application):
         if max_time > now + 60.0:
             max_time = now
         cutoff = max_time - self._max_pick_age
-        expired = [pid for pid, p in self._pick_buffer.items() if p['time'] < cutoff]
+        recovery_cutoff = max_time - self._targeted_recovery_max_age
+        expired = [
+            pid for pid, p in self._pick_buffer.items()
+            if p['time'] < (recovery_cutoff if p.get('targeted_recovery') else cutoff)
+        ]
         for pid in expired:
             del self._pick_buffer[pid]
         if expired:

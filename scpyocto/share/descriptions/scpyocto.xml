@@ -72,6 +72,26 @@
 			<parameter name="pyocto.max_pick_age" type="int" default="1800">
 				<description>Discard picks older than this many seconds from the sliding buffer</description>
 			</parameter>
+			<parameter name="pyocto.targeted_recovery_max_age" type="int" default="691200">
+				<description>Separate, longer discard age (s) for picks whose publicID identifies them as coming from gap_recovery's targeted USGS-event recovery pathway (publicID prefix "Pick/gap_recovery_targeted/"), which can arrive anywhere from ~30 minutes to ~7 days after their own pick time depending on whether the source USGS event is freshly noticed or a backlog retry.</description>
+			</parameter>
+
+			<!-- Octree gridding / discretization -->
+			<parameter name="pyocto.min_node_size" type="double" default="10.0">
+				<description>Octree node size (km) that triggers event creation and localisation/pick refinement</description>
+			</parameter>
+			<parameter name="pyocto.min_node_size_location" type="double" default="0.5">
+				<description>Octree location-search precision floor (km). Smaller values give finer locations at higher CPU cost. A floor left too coarse relative to the search area shows up as lat/lon-aligned linear artifacts in epicenter maps.</description>
+			</parameter>
+			<parameter name="pyocto.location_split_depth" type="int" default="8">
+				<description>Search depth for octree location splits. Higher values increase location resolution at higher CPU cost.</description>
+			</parameter>
+			<parameter name="pyocto.location_split_return" type="int" default="4">
+				<description>Portion of location_split_depth used only for even sampling rather than descent. Must be smaller than location_split_depth.</description>
+			</parameter>
+			<parameter name="pyocto.refinement_iterations" type="int" default="4">
+				<description>Number of localisation and pick-matching refinement iterations</description>
+			</parameter>
 		</configuration>
 	</module>
 </seiscomp>
